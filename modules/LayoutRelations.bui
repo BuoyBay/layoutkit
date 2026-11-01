@@ -1,0 +1,647 @@
+Import layoutkit.LayoutDocument
+Import editorkit
+
+Private Function ArrangementReason(document As LayoutDocument, node As LayoutNode) As String
+    If document = Nil Then Return "No layout is open"
+    If node = Nil Then Return "A selected control no longer exists in this layout"
+    If node.ParentId = "" Then Return "The layout root cannot be arranged; select its controls instead"
+    If Not node.Editable Then Return "Control '" + node.Name + "' is read-only"
+    If Not node.HasLiteralFrame Then Return "Control '" + node.Name + "' needs a literal Frame to be arranged"
+    If node.Width < 1 Or node.Height < 1 Then Return "Control '" + node.Name + "' needs a positive width and height to be arranged"
+    If node.Width > 16777216 Or node.Height > 16777216 Or node.X < -16777216 Or node.X > 16777216 Or node.Y < -16777216 Or node.Y > 16777216 Then Return "Control '" + node.Name + "' has geometry outside the supported layout range"
+    For Each item As LayoutProperty In node.Properties
+        If String.LCase(item.Name) = "visible" And String.LCase(item.RawValue) = "false" Then Return "Control '" + node.Name + "' is hidden"
+    Next
+    Dim parent As LayoutNode = document.FindNode(node.ParentId)
+    While parent <> Nil
+        If Not parent.Editable Then Return "Ancestor '" + parent.Name + "' is read-only"
+        If Not parent.HasLiteralFrame Then Return "Ancestor '" + parent.Name + "' needs a literal Frame"
+        If parent.Width < 1 Or parent.Height < 1 Then Return "Ancestor '" + parent.Name + "' needs a positive width and height"
+        If parent.Width > 16777216 Or parent.Height > 16777216 Then Return "Ancestor '" + parent.Name + "' has a size outside the supported layout range"
+        For Each item As LayoutProperty In parent.Properties
+            If String.LCase(item.Name) = "visible" And String.LCase(item.RawValue) = "false" Then Return "Ancestor '" + parent.Name + "' is hidden"
+        Next
+        If parent.ParentId = "" Then Return ""
+        If String.LCase(parent.TypeName) <> "view" Then Return "Ancestor '" + parent.Name + "' is not a supported plain View container"
+        parent = document.FindNode(parent.ParentId)
+    End While
+    Return "The control's ancestor no longer exists in this layout"
+End Function
+
+Private Function Eligible(document As LayoutDocument, node As LayoutNode) As Boolean
+    Return ArrangementReason(document, node) = ""
+End Function
+
+Private Class RelationChoice
+    Public Property Value As Integer
+    Public Property Distance As Double
+    Public Property Guide As JSONItem
+    Public Property Minimum As Integer = -16777216
+    Public Sub Constructor(value As Integer, tolerance As Integer)
+        Me.Value = value
+        Me.Distance = tolerance + 1.0
+    End Sub
+End Class
+
+Private Sub Consider(choice As RelationChoice, candidate As Double, actual As Integer, tolerance As Integer, kind As String, axis As String, related As String)
+    Dim rounded As Integer = Math.Round(candidate)
+    If rounded < choice.Minimum Or rounded > 16777216 Then Exit Sub
+    Dim distance As Double = Math.Abs(rounded - actual)
+    If distance > tolerance Or distance >= choice.Distance Then Exit Sub
+    choice.Distance = distance
+    choice.Value = rounded
+    Dim guide As JSONItem = JSONItem.NewObject()
+    guide.Value("kind") = kind
+    guide.Value("axis") = axis
+    guide.Value("actual") = actual
+    guide.Value("expected") = rounded
+    guide.Value("delta") = rounded - actual
+    guide.Value("relatedNodeId") = related
+    choice.Guide = guide
+End Sub
+
+Private Sub Near(items As JSONItem, node As LayoutNode, kind As String, axis As String, actual As Double, expected As Double, tolerance As Integer, related As String)
+    Dim delta As Double = expected - actual
+    If delta = 0 Or Math.Abs(delta) > tolerance Then Exit Sub
+    For i As Integer = 0 To items.Count() - 1
+        Dim previous As JSONItem = items.ValueAt(i)
+        If previous.Value("nodeId").AsString().Or("") = node.Id And previous.Value("kind").AsString().Or("") = kind And previous.Value("axis").AsString().Or("") = axis And previous.Value("expected").AsNumber().Or(0) = expected Then Exit Sub
+    Next
+    Dim item As JSONItem = JSONItem.NewObject()
+    item.Value("nodeId") = node.Id
+    item.Value("kind") = kind
+    item.Value("axis") = axis
+    item.Value("actual") = actual
+    item.Value("expected") = expected
+    item.Value("delta") = delta
+    item.Value("relatedNodeId") = related
+    items.Add(item)
+End Sub
+
+Private Function Coordinate(node As LayoutNode, axis As String) As Integer
+    If axis = "x" Then Return node.X
+    Return node.Y
+End Function
+
+Private Function Extent(node As LayoutNode, axis As String) As Integer
+    If axis = "x" Then Return node.Width
+    Return node.Height
+End Function
+
+Private Function CountWord(minimum As Integer) As String
+    Select Case minimum
+    Case 1
+        Return "one control"
+    Case 2
+        Return "two controls"
+    Case 3
+        Return "three controls"
+    End Select
+    Return String.From(minimum) + " controls"
+End Function
+
+' Resolve, de-duplicate and gate selected nodes. Messages are user-facing.
+Private Function Arrangeable(document As LayoutDocument, ids As Array Of String, minimum As Integer) As Array Of LayoutNode
+    If document = Nil Then Throw New InvalidArgumentException("No layout is open")
+    If Array.Count(ids) < minimum Then Throw New InvalidArgumentException("Select at least " + CountWord(minimum))
+    Dim nodes As Array Of LayoutNode = []
+    For Each id As String In ids
+        Dim node As LayoutNode = document.FindNode(id)
+        If node = Nil Then Throw New InvalidArgumentException("A selected control no longer exists in this layout")
+        If node.ParentId = "" Then Throw New InvalidArgumentException("The layout root cannot be arranged; select its controls instead")
+        For Each previous As LayoutNode In nodes
+            If previous.Id = id Then Throw New InvalidArgumentException("A control is selected more than once")
+        Next
+        Dim reason As String = ArrangementReason(document, node)
+        If reason <> "" Then Throw New InvalidArgumentException(reason)
+        nodes.Append(node)
+    Next
+    Return nodes
+End Function
+
+Private Function Selected(document As LayoutDocument, ids As Array Of String, minimum As Integer) As Array Of LayoutNode
+    Dim nodes As Array Of LayoutNode = Arrangeable(document, ids, minimum)
+    For Each node As LayoutNode In nodes
+        If node.ParentId <> nodes(0).ParentId Then Throw New InvalidArgumentException("Controls must share a container")
+    Next
+    Return nodes
+End Function
+
+' Sort by start coordinate on an axis (stable; ties keep selection order).
+Private Sub SortByAxis(nodes As Array Of LayoutNode, axis As String)
+    For i As Integer = 1 To Array.Count(nodes) - 1
+        Dim item As LayoutNode = nodes(i)
+        Dim j As Integer = i - 1
+        While j >= 0
+            If Coordinate(nodes(j), axis) <= Coordinate(item, axis) Then Exit While
+            nodes(j + 1) = nodes(j)
+            j -= 1
+        End While
+        nodes(j + 1) = item
+    Next
+End Sub
+
+' Edge position of a node; centers are doubles.
+Private Function EdgeOf(node As LayoutNode, edge As String) As Double
+    Select Case edge
+    Case "left"
+        Return node.X
+    Case "right"
+        Return node.X + node.Width
+    Case "hcenter"
+        Return node.X + node.Width / 2.0
+    Case "top"
+        Return node.Y
+    Case "bottom"
+        Return node.Y + node.Height
+    End Select
+    Return node.Y + node.Height / 2.0
+End Function
+
+Private Function HorizontalEdge(edge As String) As Boolean
+    Return edge = "left" Or edge = "right" Or edge = "hcenter"
+End Function
+
+Private Function ValidEdge(edge As String) As Boolean
+    Return Array.Contains(["left", "hcenter", "right", "top", "vcenter", "bottom"], edge)
+End Function
+
+' Integer origin that places the given edge at position.
+Private Function OriginFor(edge As String, position As Double, extent As Integer) As Integer
+    If edge = "left" Or edge = "top" Then Return Math.Round(position)
+    If edge = "right" Or edge = "bottom" Then Return Math.Round(position) - extent
+    Return Math.Round(position - extent / 2.0)
+End Function
+
+Private Function IsAncestor(document As LayoutDocument, ancestorId As String, node As LayoutNode) As Boolean
+    Dim parent As LayoutNode = document.FindNode(node.ParentId)
+    While parent <> Nil
+        If parent.Id = ancestorId Then Return True
+        parent = document.FindNode(parent.ParentId)
+    End While
+    Return False
+End Function
+
+Private Sub CheckBounds(x As Integer, y As Integer, width As Integer, height As Integer)
+    If width < 0 Or height < 0 Then Throw New InvalidArgumentException("Controls cannot have a negative size")
+    If x < -16777216 Or x > 16777216 Or y < -16777216 Or y > 16777216 Or width > 16777216 Or height > 16777216 Then Throw New InvalidArgumentException("Geometry is outside the supported layout range")
+End Sub
+
+Private Sub AppendFrame(edits As Array Of EditorEdit, document As LayoutDocument, node As LayoutNode, x As Integer, y As Integer, width As Integer, height As Integer)
+    CheckBounds(x, y, width, height)
+    For Each edit As EditorEdit In document.FrameEdits(node.Id, x, y, width, height)
+        edits.Append(edit)
+    Next
+End Sub
+
+''' Shared geometry guidance for native designers and GUI linters. All coordinates
+''' are parent-relative layout units. Profile margins/spacing are caller policy.
+Public Class LayoutRelations
+    ''' True when the arrangement batches (AlignToEdits, DistributeEdgesEdits,
+    ''' SpaceEdits, MatchSizeEdits, MoveByEdits, FramesEdits) accept this control:
+    ''' an editable, visible, non-root control with a literal positive Frame whose
+    ''' ancestors are visible, editable plain Views with literal Frames up to a root
+    ''' that also has a literal Frame. Editors use it to enable commands.
+    Public Shared Function CanArrange(document As LayoutDocument, id As String) As Boolean
+        Return LayoutRelations.ArrangementDisabledReason(document, id) = ""
+    End Function
+
+    ''' Empty exactly when CanArrange accepts this single control; otherwise a
+    ''' user-facing first-failure explanation, not a stable machine-readable code.
+    ''' Batch cardinality, duplicates, shared parents, modes and resulting geometry
+    ''' are validated separately by the requested arrangement operation.
+    Public Shared Function ArrangementDisabledReason(document As LayoutDocument, id As String) As String
+        If document = Nil Then Return "No layout is open"
+        Return ArrangementReason(document, document.FindNode(id))
+    End Function
+
+    Public Shared Function Snap(document As LayoutDocument, nodeId As String, x As Integer, y As Integer, width As Integer, height As Integer, tolerance As Integer, margins As Array Of Integer, spacing As Array Of Integer, resize As Boolean = False) As JSONItem
+        Dim outcome As JSONItem = JSONItem.NewObject()
+        outcome.Value("x") = x
+        outcome.Value("y") = y
+        outcome.Value("width") = width
+        outcome.Value("height") = height
+        Dim guides As JSONItem = JSONItem.NewArray()
+        outcome.Value("guides") = guides
+        If document = Nil Or tolerance < 1 Then Return outcome
+        If x < -16777216 Or x > 16777216 Or y < -16777216 Or y > 16777216 Then Return outcome
+        If width < 1 Or width > 16777216 Or height < 1 Or height > 16777216 Then Return outcome
+        Dim node As LayoutNode = document.FindNode(nodeId)
+        If Not Eligible(document, node) Then Return outcome
+        Dim parent As LayoutNode = document.FindNode(node.ParentId)
+        For Each axis As String In ["x", "y"]
+            Dim actual As Integer = x
+            Dim size As Integer = width
+            Dim parentSize As Integer = parent.Width
+            If axis = "y" Then
+                actual = y
+                size = height
+                parentSize = parent.Height
+            End If
+            Dim target As Integer = actual
+            If resize Then target = size
+            Dim choice As New RelationChoice(target, tolerance)
+            If resize Then choice.Minimum = 1
+            If resize Then
+                Consider(choice, parentSize - actual, size, tolerance, "parent-edge", axis, parent.Id)
+            Else
+                Consider(choice, 0, actual, tolerance, "parent-edge", axis, parent.Id)
+                Consider(choice, parentSize - size, actual, tolerance, "parent-edge", axis, parent.Id)
+                Consider(choice, (parentSize - size) / 2.0, actual, tolerance, "parent-center", axis, parent.Id)
+            End If
+            For Each margin As Integer In margins
+                If margin < 0 Then Continue For
+                If resize Then
+                    Consider(choice, parentSize - margin - actual, size, tolerance, "margin", axis, parent.Id)
+                Else
+                    Consider(choice, margin, actual, tolerance, "margin", axis, parent.Id)
+                    Consider(choice, parentSize - margin - size, actual, tolerance, "margin", axis, parent.Id)
+                End If
+            Next
+            For Each peer As LayoutNode In document.Nodes
+                If peer.Id = node.Id Or peer.ParentId <> node.ParentId Or Not Eligible(document, peer) Then Continue For
+                Dim start As Integer = Coordinate(peer, axis)
+                Dim length As Integer = Extent(peer, axis)
+                If resize Then
+                    Consider(choice, start - actual, size, tolerance, "sibling-edge", axis, peer.Id)
+                    Consider(choice, start + length - actual, size, tolerance, "sibling-edge", axis, peer.Id)
+                    Consider(choice, length, size, tolerance, "same-size", axis, peer.Id)
+                Else
+                    Consider(choice, start, actual, tolerance, "sibling-edge", axis, peer.Id)
+                    Consider(choice, start + length - size, actual, tolerance, "sibling-edge", axis, peer.Id)
+                    Consider(choice, start + (length - size) / 2.0, actual, tolerance, "sibling-center", axis, peer.Id)
+                End If
+                For Each gap As Integer In spacing
+                    If gap < 0 Then Continue For
+                    If resize Then
+                        Consider(choice, start - gap - actual, size, tolerance, "spacing", axis, peer.Id)
+                    Else
+                        Consider(choice, start + length + gap, actual, tolerance, "spacing", axis, peer.Id)
+                        Consider(choice, start - gap - size, actual, tolerance, "spacing", axis, peer.Id)
+                    End If
+                Next
+            Next
+            If choice.Guide <> Nil And (Not resize Or choice.Value >= 1) Then
+                If resize Then
+                    If axis = "x" Then
+                        outcome.Value("width") = choice.Value
+                    Else
+                        outcome.Value("height") = choice.Value
+                    End If
+                Else
+                    outcome.Value(axis) = choice.Value
+                End If
+                guides.Add(choice.Guide)
+            End If
+        Next
+        Return outcome
+    End Function
+
+    ''' Near alignment requires a consensus of at least two same-type siblings.
+    ''' Margin/spacing/centering findings are advisory near misses, never mandates.
+    Public Shared Function NearMisses(document As LayoutDocument, tolerance As Integer, margins As Array Of Integer, spacing As Array Of Integer, centerTolerance As Integer = 3) As JSONItem
+        Dim items As JSONItem = JSONItem.NewArray()
+        If document = Nil Or tolerance < 0 Or centerTolerance < 0 Then Return items
+        For Each node As LayoutNode In document.Nodes
+            If Not Eligible(document, node) Then Continue For
+            Dim parent As LayoutNode = document.FindNode(node.ParentId)
+            Near(items, node, "center", "x", node.X + node.Width / 2.0, parent.Width / 2.0, centerTolerance, parent.Id)
+            Near(items, node, "center", "y", node.Y + node.Height / 2.0, parent.Height / 2.0, centerTolerance, parent.Id)
+            For Each margin As Integer In margins
+                If margin < 0 Then Continue For
+                Near(items, node, "margin", "left", node.X, margin, tolerance, parent.Id)
+                Near(items, node, "margin", "top", node.Y, margin, tolerance, parent.Id)
+                Near(items, node, "margin", "right", parent.Width - node.X - node.Width, margin, tolerance, parent.Id)
+                Near(items, node, "margin", "bottom", parent.Height - node.Y - node.Height, margin, tolerance, parent.Id)
+            Next
+            For Each axis As String In ["x", "y"]
+                Dim actual As Integer = Coordinate(node, axis)
+                Dim ownPeers As Integer = 0
+                Dim before As LayoutNode = Nil
+                Dim after As LayoutNode = Nil
+                For Each peer As LayoutNode In document.Nodes
+                    If peer.Id = node.Id Or peer.ParentId <> node.ParentId Or Not Eligible(document, peer) Then Continue For
+                    Dim peerStart As Integer = Coordinate(peer, axis)
+                    If peer.TypeName = node.TypeName And peerStart = actual Then ownPeers += 1
+                    Dim sameLane As Boolean = peer.X = node.X
+                    If axis = "x" Then sameLane = peer.Y = node.Y
+                    If Not sameLane Then Continue For
+                    If peerStart + Extent(peer, axis) <= actual Then
+                        If before = Nil Then
+                            before = peer
+                        ElseIf peerStart + Extent(peer, axis) > Coordinate(before, axis) + Extent(before, axis) Then
+                            before = peer
+                        End If
+                    End If
+                    If peerStart >= actual + Extent(node, axis) Then
+                        If after = Nil Then
+                            after = peer
+                        ElseIf peerStart < Coordinate(after, axis) Then
+                            after = peer
+                        End If
+                    End If
+                Next
+                If before <> Nil Then
+                    Dim actualGap As Integer = actual - Coordinate(before, axis) - Extent(before, axis)
+                    Dim gapChoice As New RelationChoice(actualGap, tolerance)
+                    For Each gap As Integer In spacing
+                        If gap >= 0 Then Consider(gapChoice, gap, actualGap, tolerance, "spacing", axis, before.Id)
+                    Next
+                    If gapChoice.Guide <> Nil Then Near(items, node, "spacing", axis, actualGap, gapChoice.Value, tolerance, before.Id)
+                End If
+                If before <> Nil And after <> Nil Then
+                    If before.TypeName = node.TypeName And after.TypeName = node.TypeName Then
+                        Dim expected As Double = (Coordinate(before, axis) + Extent(before, axis) + Coordinate(after, axis) - Extent(node, axis)) / 2.0
+                        Near(items, node, "distribution", axis, actual, expected, tolerance, before.Id)
+                    End If
+                End If
+                If ownPeers > 0 Then Continue For
+                For Each peer As LayoutNode In document.Nodes
+                    If peer.Id = node.Id Or peer.ParentId <> node.ParentId Or peer.TypeName <> node.TypeName Or Not Eligible(document, peer) Then Continue For
+                    Dim expected As Integer = Coordinate(peer, axis)
+                    If expected = actual Or Math.Abs(expected - actual) > tolerance Then Continue For
+                    Dim consensus As Integer = 0
+                    For Each other As LayoutNode In document.Nodes
+                        If other.ParentId = node.ParentId And other.TypeName = node.TypeName And Eligible(document, other) And Coordinate(other, axis) = expected Then consensus += 1
+                    Next
+                    If consensus >= 2 Then
+                        Near(items, node, "alignment", axis, actual, expected, tolerance, peer.Id)
+                        Exit For
+                    End If
+                Next
+            Next
+        Next
+        Return items
+    End Function
+
+    ''' The first selected sibling is the alignment reference; edit batches retain
+    ''' source trivia and must be applied atomically against document.Version.
+    Public Shared Function AlignEdits(document As LayoutDocument, ids As Array Of String, mode As String) As Array Of EditorEdit
+        Dim nodes As Array Of LayoutNode = Selected(document, ids, 2)
+        If Not Array.Contains(["left", "right", "top", "bottom", "hcenter", "vcenter", "width", "height"], mode) Then Throw New InvalidArgumentException("Unknown alignment mode: " + mode)
+        Dim anchor As LayoutNode = nodes(0)
+        Dim edits As Array Of EditorEdit = []
+        For i As Integer = 1 To Array.Count(nodes) - 1
+            Dim node As LayoutNode = nodes(i)
+            Dim x As Integer = node.X
+            Dim y As Integer = node.Y
+            Dim width As Integer = node.Width
+            Dim height As Integer = node.Height
+            Select Case mode
+            Case "left"
+                x = anchor.X
+            Case "right"
+                x = anchor.X + anchor.Width - width
+            Case "top"
+                y = anchor.Y
+            Case "bottom"
+                y = anchor.Y + anchor.Height - height
+            Case "hcenter"
+                x = Math.Round(anchor.X + (anchor.Width - width) / 2.0)
+            Case "vcenter"
+                y = Math.Round(anchor.Y + (anchor.Height - height) / 2.0)
+            Case "width"
+                width = anchor.Width
+            Case "height"
+                height = anchor.Height
+            End Select
+            AppendFrame(edits, document, node, x, y, width, height)
+        Next
+        Return edits
+    End Function
+
+    ''' Equal gaps retain first/last positions; integer rounding is deterministic.
+    Public Shared Function DistributeEdits(document As LayoutDocument, ids As Array Of String, axis As String) As Array Of EditorEdit
+        If axis <> "x" And axis <> "y" Then Throw New InvalidArgumentException("Distribution axis must be x or y")
+        Dim nodes As Array Of LayoutNode = Selected(document, ids, 3)
+        For i As Integer = 0 To Array.Count(nodes) - 2
+            For j As Integer = i + 1 To Array.Count(nodes) - 1
+                If Coordinate(nodes(j), axis) < Coordinate(nodes(i), axis) Then
+                    Dim temporary As LayoutNode = nodes(i)
+                    nodes(i) = nodes(j)
+                    nodes(j) = temporary
+                End If
+            Next
+        Next
+        Dim used As Integer = 0
+        For i As Integer = 0 To Array.Count(nodes) - 2
+            used += Extent(nodes(i), axis)
+        Next
+        Dim start As Integer = Coordinate(nodes(0), axis)
+        Dim free As Integer = Coordinate(Array.Last(nodes), axis) - start - used
+        If free < 0 Then Throw New InvalidArgumentException("Controls overlap too much to space evenly; spread them apart first")
+        Dim divisions As Double = Array.Count(nodes) - 1
+        Dim gap As Double = free / divisions
+        Dim cursor As Double = start
+        Dim edits As Array Of EditorEdit = []
+        For i As Integer = 0 To Array.Count(nodes) - 2
+            Dim node As LayoutNode = nodes(i)
+            If i > 0 Then
+                Dim x As Integer = node.X
+                Dim y As Integer = node.Y
+                If axis = "x" Then
+                    x = Math.Round(cursor)
+                Else
+                    y = Math.Round(cursor)
+                End If
+                AppendFrame(edits, document, node, x, y, node.Width, node.Height)
+            End If
+            cursor += Extent(node, axis) + gap
+        Next
+        Return edits
+    End Function
+    ''' Align to the selection bounds, the key control (ids(0)) or each control's
+    ''' own container (0, 0, width, height). Parent-relative; one atomic batch.
+    Public Shared Function AlignToEdits(document As LayoutDocument, ids As Array Of String, mode As String, reference As String) As Array Of EditorEdit
+        If Not ValidEdge(mode) Then Throw New InvalidArgumentException("Unknown alignment: " + mode)
+        If reference <> "selection" And reference <> "key" And reference <> "parent" Then Throw New InvalidArgumentException("Unknown alignment reference: " + reference)
+        Dim nodes As Array Of LayoutNode
+        If reference = "parent" Then
+            nodes = Arrangeable(document, ids, 1)
+        Else
+            nodes = Selected(document, ids, 2)
+        End If
+        Dim left As Integer = nodes(0).X
+        Dim top As Integer = nodes(0).Y
+        Dim right As Integer = nodes(0).X + nodes(0).Width
+        Dim bottom As Integer = nodes(0).Y + nodes(0).Height
+        If reference = "selection" Then
+            For Each node As LayoutNode In nodes
+                left = Math.Min(left, node.X)
+                top = Math.Min(top, node.Y)
+                right = Math.Max(right, node.X + node.Width)
+                bottom = Math.Max(bottom, node.Y + node.Height)
+            Next
+        End If
+        Dim edits As Array Of EditorEdit = []
+        For i As Integer = 0 To Array.Count(nodes) - 1
+            Dim node As LayoutNode = nodes(i)
+            If reference = "key" And i = 0 Then Continue For
+            If reference = "parent" Then
+                Dim parent As LayoutNode = document.FindNode(node.ParentId)
+                left = 0
+                top = 0
+                right = parent.Width
+                bottom = parent.Height
+            End If
+            Dim x As Integer = node.X
+            Dim y As Integer = node.Y
+            Select Case mode
+            Case "left"
+                x = left
+            Case "right"
+                x = right - node.Width
+            Case "hcenter"
+                x = Math.Round(left + (right - left - node.Width) / 2.0)
+            Case "top"
+                y = top
+            Case "bottom"
+                y = bottom - node.Height
+            Case "vcenter"
+                y = Math.Round(top + (bottom - top - node.Height) / 2.0)
+            End Select
+            AppendFrame(edits, document, node, x, y, node.Width, node.Height)
+        Next
+        Return edits
+    End Function
+
+    ''' Equalise one edge between the outermost controls (3+ siblings). The
+    ''' outermost controls keep their positions; sizes never change.
+    Public Shared Function DistributeEdgesEdits(document As LayoutDocument, ids As Array Of String, edge As String) As Array Of EditorEdit
+        If Not ValidEdge(edge) Then Throw New InvalidArgumentException("Unknown distribution edge: " + edge)
+        If Array.Count(ids) < 3 Then Throw New InvalidArgumentException("Select at least three controls to distribute")
+        Dim nodes As Array Of LayoutNode = Selected(document, ids, 3)
+        For i As Integer = 1 To Array.Count(nodes) - 1
+            Dim item As LayoutNode = nodes(i)
+            Dim j As Integer = i - 1
+            While j >= 0
+                If EdgeOf(nodes(j), edge) <= EdgeOf(item, edge) Then Exit While
+                nodes(j + 1) = nodes(j)
+                j -= 1
+            End While
+            nodes(j + 1) = item
+        Next
+        Dim first As Double = EdgeOf(nodes(0), edge)
+        Dim span As Double = EdgeOf(Array.Last(nodes), edge) - first
+        Dim divisions As Double = Array.Count(nodes) - 1
+        Dim edits As Array Of EditorEdit = []
+        For i As Integer = 1 To Array.Count(nodes) - 2
+            Dim node As LayoutNode = nodes(i)
+            Dim position As Double = first + span * i / divisions
+            Dim x As Integer = node.X
+            Dim y As Integer = node.Y
+            If HorizontalEdge(edge) Then
+                x = OriginFor(edge, position, node.Width)
+            Else
+                y = OriginFor(edge, position, node.Height)
+            End If
+            AppendFrame(edits, document, node, x, y, node.Width, node.Height)
+        Next
+        Return edits
+    End Function
+
+    ''' Gap commands along axis x|y. mode: equal (3+, outermost fixed), increase,
+    ''' decrease (by amount, never below touching), remove (gap 0) or set
+    ''' (gap = amount). The first control in axis order stays fixed.
+    Public Shared Function SpaceEdits(document As LayoutDocument, ids As Array Of String, axis As String, mode As String, amount As Integer) As Array Of EditorEdit
+        If axis <> "x" And axis <> "y" Then Throw New InvalidArgumentException("Spacing axis must be x or y")
+        If Not Array.Contains(["equal", "increase", "decrease", "remove", "set"], mode) Then Throw New InvalidArgumentException("Unknown spacing command: " + mode)
+        If mode = "equal" Then
+            If Array.Count(ids) < 3 Then Throw New InvalidArgumentException("Select at least three controls to space evenly")
+            Return LayoutRelations.DistributeEdits(document, ids, axis)
+        End If
+        If (mode = "increase" Or mode = "decrease") And amount < 1 Then Throw New InvalidArgumentException("Spacing step must be at least 1")
+        If mode = "set" And amount < 0 Then Throw New InvalidArgumentException("Spacing cannot be negative")
+        Dim nodes As Array Of LayoutNode = Selected(document, ids, 2)
+        SortByAxis(nodes, axis)
+        Dim edits As Array Of EditorEdit = []
+        Dim previousEnd As Integer = Coordinate(nodes(0), axis) + Extent(nodes(0), axis)
+        Dim cursor As Integer = previousEnd
+        For i As Integer = 1 To Array.Count(nodes) - 1
+            Dim node As LayoutNode = nodes(i)
+            Dim gap As Integer = Coordinate(node, axis) - previousEnd
+            Dim wanted As Integer = gap
+            Select Case mode
+            Case "increase"
+                wanted = gap + amount
+            Case "decrease"
+                If gap > 0 Then wanted = Math.Max(0, gap - amount)
+            Case "remove"
+                wanted = 0
+            Case "set"
+                wanted = amount
+            End Select
+            previousEnd = Coordinate(node, axis) + Extent(node, axis)
+            Dim start As Integer = cursor + wanted
+            Dim x As Integer = node.X
+            Dim y As Integer = node.Y
+            If axis = "x" Then
+                x = start
+            Else
+                y = start
+            End If
+            AppendFrame(edits, document, node, x, y, node.Width, node.Height)
+            cursor = start + Extent(node, axis)
+        Next
+        Return edits
+    End Function
+
+    ''' Match width, height or both to the key control ids(0). Controls may live in
+    ''' different containers; positions never change.
+    Public Shared Function MatchSizeEdits(document As LayoutDocument, ids As Array Of String, dimension As String) As Array Of EditorEdit
+        If dimension <> "width" And dimension <> "height" And dimension <> "both" Then Throw New InvalidArgumentException("Size dimension must be width, height or both")
+        Dim nodes As Array Of LayoutNode = Arrangeable(document, ids, 2)
+        Dim anchor As LayoutNode = nodes(0)
+        Dim edits As Array Of EditorEdit = []
+        For i As Integer = 1 To Array.Count(nodes) - 1
+            Dim node As LayoutNode = nodes(i)
+            Dim width As Integer = node.Width
+            Dim height As Integer = node.Height
+            If dimension <> "height" Then width = anchor.Width
+            If dimension <> "width" Then height = anchor.Height
+            AppendFrame(edits, document, node, node.X, node.Y, width, height)
+        Next
+        Return edits
+    End Function
+
+    ''' Offset every selected control by (dx, dy) in its own parent coordinates. A
+    ''' control whose ancestor is also selected moves with that ancestor only.
+    Public Shared Function MoveByEdits(document As LayoutDocument, ids As Array Of String, dx As Integer, dy As Integer) As Array Of EditorEdit
+        Dim nodes As Array Of LayoutNode = Arrangeable(document, ids, 1)
+        Dim edits As Array Of EditorEdit = []
+        For Each node As LayoutNode In nodes
+            Dim covered As Boolean = False
+            For Each other As LayoutNode In nodes
+                If other.Id <> node.Id And IsAncestor(document, other.Id, node) Then covered = True
+            Next
+            If covered Then Continue For
+            If dx < -16777216 - node.X Or dx > 16777216 - node.X Or dy < -16777216 - node.Y Or dy > 16777216 - node.Y Then Throw New InvalidArgumentException("Geometry is outside the supported layout range")
+            AppendFrame(edits, document, node, node.X + dx, node.Y + dy, node.Width, node.Height)
+        Next
+        Return edits
+    End Function
+
+    ''' Commit explicit frames: frames is a JSON array of {x, y, width, height}
+    ''' objects aligned with ids (group drag/resize previews). Values are rounded.
+    Public Shared Function FramesEdits(document As LayoutDocument, ids As Array Of String, frames As JSONItem) As Array Of EditorEdit
+        If document = Nil Then Throw New InvalidArgumentException("No layout is open")
+        If frames = Nil Then Throw New InvalidArgumentException("Expected one frame per selected control")
+        If Not frames.IsArray() Or frames.Count() <> Array.Count(ids) Then Throw New InvalidArgumentException("Expected one frame per selected control")
+        Dim nodes As Array Of LayoutNode = Arrangeable(document, ids, 1)
+        Dim edits As Array Of EditorEdit = []
+        For i As Integer = 0 To Array.Count(nodes) - 1
+            Dim frame As JSONItem = frames.ValueAt(i)
+            If Not frame.IsObject() Then Throw New InvalidArgumentException("Each frame must be an object with x, y, width and height")
+            Dim values As Array Of Integer = []
+            For Each key As String In ["x", "y", "width", "height"]
+                Dim value As JSONItem = frame.Value(key)
+                If Not value.IsNumber() Then Throw New InvalidArgumentException("Each frame must be an object with x, y, width and height")
+                Dim number As Double = value.AsNumber().Or(0)
+                If Not (number >= -16777216.0 And number <= 16777216.0) Then Throw New InvalidArgumentException("Geometry is outside the supported layout range")
+                values.Append(Math.Round(number))
+            Next
+            AppendFrame(edits, document, nodes(i), values(0), values(1), values(2), values(3))
+        Next
+        Return edits
+    End Function
+End Class

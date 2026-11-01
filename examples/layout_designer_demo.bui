@@ -1,0 +1,309 @@
+Import editorkit
+Import layoutkit.LayoutDocument
+Import layoutkit.LayoutCatalog
+Import layoutkit.LayoutRefactor
+Import layoutcanvas
+Import designerwidgets
+
+Private Function DemoSource() As String
+    Return "' Unknown source and comments survive editing.\nImport designerwidgets.DesignerWidgets\nWindow BadgeWindow\n    Title = \"Badge demo\"\n    Frame = (0, 0, 560, 360)\n    Control StatusBadge badge\n        Frame = (40, 50, 180, 36) ' keep this comment\n        Tone = \"calm\"\n        FutureValue = ComputeTheme()\n    End Control\nEnd Window\n"
+End Function
+
+Class LayoutDemoHost Implements LayoutEditorHost, LayoutProjectRefactorHost
+    Public Property Document As EditorDocument = New EditorDocument(DemoSource())
+    Public Property Editor As LayoutEditor
+    Public Property LastStatus As String = ""
+    Public Property Selection As String = ""
+    Public Function Snapshot() As LayoutDocument
+        Return New LayoutDocument(Me.Document.Text, Me.Document.Version)
+    End Function
+    Public Sub Refresh()
+        If Me.Editor IsNot Nil Then Me.Editor.LoadDocument(Me.Snapshot())
+    End Sub
+    Public Function CommitLayoutEdits(expectedVersion As Integer, edits As Array Of EditorEdit) As Boolean
+        If expectedVersion <> Me.Document.Version Then Return False
+        Try
+            Dim changed As Boolean = Me.Document.ApplyEdits(edits)
+            Me.Refresh()
+            Return changed
+        Catch e As Exception
+            Me.LastStatus = e.Message
+            Return False
+        End Try
+    End Function
+    ' This example is a complete in-memory project with exactly one source buffer.
+    Private Function Refactor(expectedVersion As Integer, nodeId As String, newName As String, deleting As Boolean) As Boolean
+        If expectedVersion <> Me.Document.Version Then Return False
+        Try
+            Dim items As JSONItem = JSONItem.NewArray()
+            Dim item As JSONItem = JSONItem.NewObject()
+            item.Value("id") = "demo.bui"
+            item.Value("text") = Me.Document.Text
+            item.Value("version") = Me.Document.Version
+            items.Add(item)
+            Dim planner As New LayoutProjectRefactor()
+            Dim plan As JSONItem
+            If deleting Then
+                plan = planner.PlanDelete(items, "demo.bui", nodeId)
+            Else
+                plan = planner.PlanRename(items, "demo.bui", nodeId, newName)
+            End If
+            If plan.Count() = 0 Then Return False
+            If plan.Count() <> 1 Then Throw New Exception("Unexpected buffer in demo refactor")
+            Dim change As JSONItem = plan.ValueAt(0)
+            If change.Value("id").AsString().Or("") <> "demo.bui" Then Return False
+            If change.Value("version").AsNumber().Or(0.0) <> Me.Document.Version Then Return False
+            Dim edits As Array Of EditorEdit = []
+            Dim encoded As JSONItem = change.Value("edits")
+            For i As Integer = 0 To encoded.Count() - 1
+                Dim edit As JSONItem = encoded.ValueAt(i)
+                Dim first As Integer = edit.Value("startByte").AsNumber().Value
+                Dim finish As Integer = edit.Value("endByte").AsNumber().Value
+                edits.Append(New EditorEdit(first, finish, edit.Value("replacement").AsString().Value))
+            Next
+            Return Me.CommitLayoutEdits(expectedVersion, edits)
+        Catch e As Exception
+            Me.LayoutStatus(e.Message)
+            Return False
+        End Try
+    End Function
+    Public Function RenameLayoutControl(expectedVersion As Integer, nodeId As String, newName As String) As Boolean
+        Return Me.Refactor(expectedVersion, nodeId, newName, False)
+    End Function
+    Public Function DeleteLayoutControl(expectedVersion As Integer, nodeId As String) As Boolean
+        Return Me.Refactor(expectedVersion, nodeId, "", True)
+    End Function
+    Public Sub LayoutSelectionChanged(nodeId As String)
+        Me.Selection = nodeId
+    End Sub
+    Public Sub LayoutStatus(message As String)
+        Me.LastStatus = message
+        Print message
+    End Sub
+    Public Sub Command(action As String)
+        Select Case action
+            Case "Undo"
+                Me.Document.Undo()
+            Case "Redo"
+                Me.Document.Redo()
+            Case "Mark saved (memory)"
+                Me.Document.MarkSaved()
+                Print "Saved baseline in memory; no file was written"
+        End Select
+        Me.Refresh()
+    End Sub
+End Class
+
+Private Class DemoCommandButton Inherits Button
+    Public Property Host As LayoutDemoHost
+    Handle Action()
+        Me.Host.Command(Me.Caption)
+    End Handle
+End Class
+
+Class LayoutDemoWindow Inherits Window
+    Public Property Host As LayoutDemoHost = New LayoutDemoHost()
+    Public Property Editor As LayoutEditor = New LayoutEditor()
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.Title = "Native layout editor · third-party badge"
+        Me.Move(80, 80, 1120, 740)
+        Me.Editor.Catalog.RegisterBuiltinControls()
+        RegisterDesignerWidgets(Me.Editor.Catalog)
+        Me.Host.Editor = Me.Editor
+        Me.Editor.AttachHost(Me.Host)
+        Me.Editor.Move(10, 50, 1100, 680)
+        Me.Editor.LayoutPanel(1100, 680)
+        Me.Host.Refresh()
+        Me.AddSubview(Me.Editor)
+        For Each node As LayoutNode In Me.Host.Snapshot().Nodes
+            If node.Name = "badge" Then Me.Editor.SelectNode(node.Id)
+        Next
+        If Not Me.Editor.SelectProperty("Tone") Then Throw New Exception("Tone inspector missing")
+        Dim x As Integer = 10
+        For Each caption As String In ["Undo", "Redo", "Mark saved (memory)"]
+            Dim button As New DemoCommandButton()
+            button.Host = Me.Host
+            button.Caption = caption
+            button.Move(x, 10, 180, 30)
+            Me.AddSubview(button)
+            x += 190
+        Next
+        If StatusBadge.ConstructorCalls <> 0 Then Throw New Exception("Loading source constructed a control")
+    End Sub
+    Handle Opening()
+        Me.Editor.OpenInput()
+    End Handle
+    Handle Closing() As Boolean
+        Me.Editor.CloseInput()
+        Return False
+    End Handle
+    Handle Closed()
+        Me.Editor.CloseInput()
+        Me.Editor.DetachHost()
+        Me.Host.Editor = Nil
+        Application.Quit()
+    End Handle
+End Class
+
+Private Class DemoToneFactory Implements LayoutPropertyViewFactory
+    Public Property Inner As LayoutPropertyViewFactory
+    Public Property LastView As BadgeToneView
+    Public Property LastHost As LayoutPropertyEditorHost
+    Public Function EditorId() As String
+        Return "demo.tone.binding"
+    End Function
+    Public Function CreateView(currentExpression As String, host As LayoutPropertyEditorHost) As View
+        Me.LastHost = host
+        Me.LastView = CType(Me.Inner.CreateView(currentExpression, host), BadgeToneView)
+        Return Me.LastView
+    End Function
+End Class
+
+Private Sub Require(passed As Boolean, message As String)
+    If Not passed Then Throw New Exception(message)
+End Sub
+
+' The compiled registration matches plugin.json: a stable package identity that
+' bare source reaches only through its import, one palette entry when both
+' registration paths run, and agreeing editor ids.
+Private Sub BadgeIdentityAssertions(catalog As LayoutCatalog)
+    Dim badge As LayoutControlDescriptor = catalog.Find("designerwidgets.StatusBadge")
+    Require(catalog.Find("StatusBadge") Is Nil, "Compiled badge must not register a bare identity")
+    Require(badge.Metadata.Value("sourceTypeName").AsString().Or("") = "StatusBadge", "Source spelling metadata")
+    Require(badge.Metadata.Value("sourceImport").AsString().Or("") = "designerwidgets.DesignerWidgets", "Source import metadata")
+    Require(badge.Properties(0).EditorId = "designerwidgets.StatusBadge.Tone", "Editor id agrees with plugin.json")
+    Dim noImports As Array Of String = []
+    Require(catalog.FindSource("StatusBadge", noImports) Is Nil, "A project's own StatusBadge must not resolve to the package badge")
+    Require(catalog.FindSource("StatusBadge", ["designerwidgets.DesignerWidgets"]) = badge, "Imported source resolves the package badge")
+    ' Registering again (as after data-only discovery) keeps a single entry.
+    Dim before As Integer = Array.Count(catalog.Controls())
+    RegisterDesignerWidgets(catalog)
+    Require(Array.Count(catalog.Controls()) = before, "Repeated registration must not add a second palette entry")
+    ' The renderer's expression branch reads $expressions (the typed key is
+    ' removed for non-literal source values).
+    Dim renderer As StatusBadgeRenderer = TryCast(catalog.RendererFor("designerwidgets.StatusBadge"), StatusBadgeRenderer)
+    Require(renderer IsNot Nil, "Compiled renderer registered")
+    Dim editor As New LayoutEditor()
+    editor.Catalog = catalog
+    Dim text As String = "Import designerwidgets.DesignerWidgets\nWindow W\n    Frame = (0, 0, 300, 200)\n    Control StatusBadge computed\n        Frame = (10, 10, 180, 36)\n        Tone = ComputeTheme()\n    End Control\n    Control StatusBadge loud\n        Frame = (10, 60, 180, 36)\n        Tone = \"alert\"\n    End Control\n    Control StatusBadge plain\n        Frame = (10, 110, 180, 36)\n    End Control\nEnd Window\n"
+    Dim document As New LayoutDocument(text, 1)
+    editor.LoadDocument(document)
+    For Each node As LayoutNode In document.Nodes
+        Dim tone As String = renderer.ToneFor(editor.RendererValuesFor(node.Id))
+        If node.Name = "computed" Then Require(tone = "expression", "Computed tone paints the expression state: " + tone)
+        If node.Name = "loud" Then Require(tone = "alert", "Literal alert tone: " + tone)
+        If node.Name = "plain" Then Require(tone = "calm", "Default tone: " + tone)
+    Next
+End Sub
+
+Private Sub RunAssertions()
+    Dim catalog As New LayoutCatalog()
+    RegisterDesignerWidgets(catalog)
+    Require(catalog.Find("designerwidgets.StatusBadge") IsNot Nil, "Missing descriptor")
+    Require(catalog.RendererFor("designerwidgets.StatusBadge") IsNot Nil, "Missing renderer")
+    BadgeIdentityAssertions(catalog)
+    Require(catalog.EditorFor("designerwidgets.StatusBadge.Tone") IsNot Nil, "Missing editor")
+    Require(catalog.EditorViewFor("designerwidgets.StatusBadge.Tone") IsNot Nil, "Missing native editor factory")
+    Require(catalog.RendererFor("MissingControl") Is Nil, "Unknown renderer must be absent")
+    Require(Not catalog.EditorFor("designerwidgets.StatusBadge.Tone").EditExpression("ComputeTheme()").HasValue, "Unknown expression was rewritten")
+    Dim host As New LayoutDemoHost()
+    Dim original As String = host.Document.Text
+    Dim snapshot As LayoutDocument = host.Snapshot()
+    Dim badgeId As String = ""
+    For Each node As LayoutNode In snapshot.Nodes
+        If node.Name = "badge" Then badgeId = node.Id
+    Next
+    Require(badgeId <> "", "Custom source node missing")
+    Require(StatusBadge.ConstructorCalls = 0, "Registration or parsing ran a constructor")
+    Dim edits As Array Of EditorEdit = snapshot.FrameEdits(badgeId, 64, 72, 200, 40)
+    Require(host.CommitLayoutEdits(snapshot.Version, edits), "Frame commit failed")
+    Require(host.Document.Version = snapshot.Version + 1, "Gesture must be one transaction")
+    Require(Not host.CommitLayoutEdits(snapshot.Version, edits), "Stale commit accepted")
+    Require(String.InStr(host.Document.Text, "FutureValue = ComputeTheme()") > 0, "Unknown value lost")
+    Require(String.InStr(host.Document.Text, "' keep this comment") > 0, "Comment lost")
+    Dim moved As String = host.Document.Text
+    Require(host.Document.Undo(), "Undo failed")
+    Require(host.Document.Text = original, "Undo did not restore exact source")
+    Require(host.Document.Redo(), "Redo failed")
+    Require(host.Document.Text = moved, "Redo did not restore exact source")
+    host.Document.MarkSaved()
+    Require(Not host.Document.IsDirty, "Saved baseline remains dirty")
+    snapshot = host.Snapshot()
+    For Each node As LayoutNode In snapshot.Nodes
+        If node.Name = "badge" Then badgeId = node.Id
+    Next
+    Require(host.CommitLayoutEdits(snapshot.Version, snapshot.PropertyEdits(badgeId, "Tone", "\"alert\"")), "Property edit failed")
+    Require(host.Document.IsDirty, "Property edit should be dirty")
+    Require(host.Document.Undo(), "Property undo failed")
+    Require(Not host.Document.IsDirty, "Undo to saved text should be clean")
+    snapshot = host.Snapshot()
+    For Each node As LayoutNode In snapshot.Nodes
+        If node.Name = "badge" Then badgeId = node.Id
+    Next
+    ' Exercise the real LayoutEditor descriptor validation and snapshot binding.
+    Dim factory As New DemoToneFactory()
+    factory.Inner = catalog.EditorViewFor("designerwidgets.StatusBadge.Tone")
+    catalog.RegisterEditorView(factory)
+    Dim toneDescriptor As LayoutPropertyDescriptor = catalog.Find("designerwidgets.StatusBadge").Properties(0)
+    toneDescriptor.EditorId = factory.EditorId()
+    Require(toneDescriptor.ValidateExpression("\"alert\""), "Tone descriptor must accept native editor choices")
+    Dim editor As New LayoutEditor()
+    editor.Catalog = catalog
+    editor.AttachHost(host)
+    host.Editor = editor
+    editor.LoadDocument(snapshot)
+    editor.SelectNode(badgeId)
+    Require(editor.SelectProperty("Tone"), "Tone property not available in inspector")
+    Dim toneView As BadgeToneView = factory.LastView
+    Dim oldBinding As LayoutPropertyEditorHost = factory.LastHost
+    Require(toneView IsNot Nil, "Factory must return native tone view")
+    toneView.PerformChoice("alert")
+    Require(host.Document.Version = snapshot.Version + 1, "Native button did not commit through LayoutEditor")
+    Require(String.Contains(host.Document.Text, "Tone = \"alert\"", True), "Native choice missing from source")
+    Dim committed As String = host.Document.Text
+    Require(Not oldBinding.CommitExpression("\"calm\""), "Stale native editor commit accepted")
+    Require(host.Document.Text = committed, "Rejected native editor changed source")
+    For i As Integer = 1 To 50
+        host.Refresh()
+        Require(editor.SelectProperty("Tone"), "Tone remains selectable after reload")
+        Require(editor.CustomViewCount = 1, "Reusable badge editor must retain only one native view")
+    Next
+    Dim beforeRebind As Integer = host.Document.Version
+    factory.LastView.PerformChoice("calm")
+    Require(host.Document.Version = beforeRebind + 1, "Reused native editor did not commit with fresh binding")
+    Require(Not oldBinding.CommitExpression("\"alert\""), "Rebinding revived an expired callback")
+    editor.DetachHost()
+    host.Editor = Nil
+    Require(StatusBadge.ConstructorCalls = 0, "Native property editor constructed runtime badge")
+    Print "layout designer extensibility assertions passed (in-memory save)"
+End Sub
+
+Private Class DemoExitTimer Inherits Timer
+    Public Property Demo As LayoutDemoWindow
+    Public Overrides Sub NotifyTick()
+        Me.Stop()
+        Me.Demo.Editor.DetachHost()
+        Me.Demo.Host.Editor = Nil
+        Print "layout designer GUI loaded custom renderer and native inspector"
+        Application.Quit()
+    End Sub
+End Class
+
+Sub Main(args As Array Of String)
+    If Array.Contains(args, "--self-test") Then
+        RunAssertions()
+        Dim demo As New LayoutDemoWindow()
+        demo.Show()
+        Dim timer As New DemoExitTimer()
+        timer.Demo = demo
+        timer.Period = 150
+        timer.Count = 1
+        timer.Start()
+        Application.Run()
+        Return
+    End If
+    Dim window As New LayoutDemoWindow()
+    window.Show()
+    Application.Run()
+End Sub

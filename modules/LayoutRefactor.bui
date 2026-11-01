@@ -1,0 +1,533 @@
+Import editorkit
+Import layoutkit.LayoutDocument
+
+' Hosts apply the complete project plan against every captured workspace revision.
+Public Interface LayoutProjectRefactorHost
+    Function RenameLayoutControl(expectedVersion As Integer, nodeId As String, newName As String) As Boolean
+    Function DeleteLayoutControl(expectedVersion As Integer, nodeId As String) As Boolean
+End Interface
+
+Private Sub LRFail(reason As String)
+    Throw New InvalidArgumentException("Project refactor: " + reason)
+End Sub
+
+Private Function LRLower(value As String) As String
+    Return String.LCase(value)
+End Function
+
+Private Function LRWord(c As Integer, first As Boolean) As Boolean
+    Return c >= 65 And c <= 90 Or c >= 97 And c <= 122 Or c = 95 Or c >= 128 Or Not first And c >= 48 And c <= 57
+End Function
+
+Private Class LRToken
+    Public Property Text As String
+    Public Property First As Integer
+    Public Property Last As Integer
+    Public Property Line As Integer
+    Public Property Owner As String = ""
+    Public Property Scope As Integer = 0
+    Public Property BlockDepth As Integer = 0
+    Public Property Layout As String = ""
+    Public Property Quoted As Boolean = False
+    Public Sub Constructor(text As String, first As Integer, finish As Integer, line As Integer)
+        Me.Text = text
+        Me.First = first
+        Me.Last = finish
+        Me.Line = line
+    End Sub
+End Class
+
+Private Class LRType
+    Public Property Name As String
+    Public Property Base As String = ""
+    Public Property Root As Boolean = False
+    Public Property BufferId As String
+End Class
+
+Private Class LRBuffer
+    Public Property Id As String
+    Public Property Version As Integer
+    Public Property Source As String
+    Public Property Model As LayoutDocument
+    Public Property Tokens As Array Of LRToken = []
+    Public Property Edits As Array Of EditorEdit = []
+End Class
+
+' Tokenization is byte-based. Neither comments nor quoted text become identifiers.
+' Unsupported lexical/structural constructs fail closed instead of guessing scopes.
+Private Sub LRScan(buffer As LRBuffer, types As Array Of LRType)
+    Dim sourceText As String = buffer.Source
+    Dim bytes As Bytes = Bytes.FromString(sourceText, Text.Encodings.UTF8)
+    Dim depth As Integer = 0
+    Dim line As Integer = 0
+    Dim i As Integer = 0
+    While i < bytes.Count
+        Dim c As Integer = bytes.Item(i)
+        Dim nextByte As Integer = -1
+        If i + 1 < bytes.Count Then nextByte = bytes.Item(i + 1)
+        If c = 10 Then line += 1
+        If depth > 0 Then
+            If c = 47 And nextByte = 42 Then
+                depth += 1
+                i += 2
+            ElseIf c = 42 And nextByte = 47 Then
+                depth -= 1
+                i += 2
+            Else
+                i += 1
+            End If
+            Continue While
+        End If
+        If c = 47 And nextByte = 42 Then
+            depth = 1
+            i += 2
+            Continue While
+        End If
+        If c = 39 Or c = 47 And nextByte = 47 Then
+            While i < bytes.Count
+                If bytes.Item(i) = 10 Then Exit While
+                i += 1
+            End While
+            Continue While
+        End If
+        If c = 32 Or c = 9 Or c = 10 Or c = 13 Then
+            i += 1
+            Continue While
+        End If
+        Dim start As Integer = i
+        Dim quoted As Boolean = c = 34
+        If quoted Then
+            i += 1
+            Dim closed As Boolean = False
+            While i < bytes.Count
+                c = bytes.Item(i)
+                If c < 32 Then LRFail("multiline or broken string")
+                i += 1
+                If c = 34 Then
+                    closed = True
+                    Exit While
+                End If
+                If c = 92 Then
+                    If i >= bytes.Count Then LRFail("broken escape")
+                    c = bytes.Item(i)
+                    If c <> 110 And c <> 114 And c <> 116 And c <> 34 And c <> 92 Then LRFail("unsupported escape")
+                    i += 1
+                End If
+            End While
+            If Not closed Then LRFail("unterminated string")
+        ElseIf LRWord(c, True) Then
+            i += 1
+            While i < bytes.Count
+                If Not LRWord(bytes.Item(i), False) Then Exit While
+                i += 1
+            End While
+        Else
+            i += 1
+        End If
+        Dim token As New LRToken(String.SubstringBytes(sourceText, start, i - start), start, i, line)
+        token.Quoted = quoted
+        Array.Append(buffer.Tokens, token)
+    End While
+    If depth <> 0 Then LRFail("unterminated comment")
+    Dim owner As String = ""
+    Dim layout As String = ""
+    Dim controls As Integer = 0
+    Dim scope As Integer = 0
+    Dim scopeSerial As Integer = 0
+    Dim blocks As Integer = 0
+    Dim tokens As Array Of LRToken = buffer.Tokens
+    For index As Integer = 0 To Array.Count(tokens) - 1
+        Dim token As LRToken = tokens(index)
+        Dim word As String = LRLower(token.Text)
+        Dim previous As String = ""
+        If index > 0 Then previous = LRLower(tokens(index - 1).Text)
+        Dim following As String = ""
+        If index + 1 < Array.Count(tokens) Then following = LRLower(tokens(index + 1).Text)
+        If Not token.Quoted Then
+            If word = "#" Or word = ":" Or word = "_" Or word = "namespace" Or word = "lambda" Or word = "closure" Then LRFail("conditional, continuation, namespace or colon scope requires semantic resolution")
+            If word = "class" And previous <> "end" Then
+                If owner <> "" Or layout <> "" Then LRFail("nested class")
+                If following = "" Then LRFail("missing class name")
+                If index + 2 < Array.Count(tokens) Then
+                    If LRLower(tokens(index + 2).Text) = "of" Then LRFail("generic inheritance requires compiler symbol resolution")
+                End If
+                owner = following
+                Dim record As New LRType()
+                record.Name = owner
+                record.BufferId = buffer.Id
+                If index + 3 < Array.Count(tokens) Then
+                    If LRLower(tokens(index + 2).Text) = "inherits" Then
+                        record.Base = LRLower(tokens(index + 3).Text)
+                        If index + 4 < Array.Count(tokens) Then
+                            If tokens(index + 4).Text = "." Then LRFail("qualified inheritance needs compiler symbol resolution")
+                        End If
+                    End If
+                End If
+                Array.Append(types, record)
+            ElseIf (word = "window" Or word = "view") And previous <> "end" And owner = "" And layout = "" And scope = 0 Then
+                ' Only a declaration at the beginning of a physical line is a root.
+                Dim header As Boolean = index = 0
+                If index > 0 Then header = tokens(index - 1).Line <> token.Line Or previous = "public" Or previous = "private"
+                If index + 1 >= Array.Count(tokens) Then header = False
+                If index + 1 < Array.Count(tokens) Then
+                    If tokens(index + 1).Line <> token.Line Or following = "." Or following = "(" Or following = "=" Then header = False
+                End If
+                If header Then
+                    layout = following
+                    Dim record As New LRType()
+                    record.Name = layout
+                    record.Root = True
+                    record.BufferId = buffer.Id
+                    Array.Append(types, record)
+                End If
+            ElseIf word = "control" And previous <> "end" And layout <> "" Then
+                Dim header As Boolean = index = 0
+                If index > 0 Then header = tokens(index - 1).Line <> token.Line
+                If header Then controls += 1
+            End If
+            If (word = "sub" Or word = "function" Or word = "handle") And previous <> "end" And previous <> "exit" Then
+                scopeSerial += 1
+                scope = scopeSerial
+            End If
+        End If
+        Dim statementHead As Boolean = index = 0
+        If index > 0 Then statementHead = tokens(index - 1).Line <> token.Line
+        Dim endHead As Boolean = False
+        If index >= 2 And previous = "end" Then endHead = tokens(index - 2).Line <> token.Line
+        If Not token.Quoted Then
+            If statementHead And (word = "if" Or word = "for" Or word = "while" Or word = "do" Or word = "select" Or word = "try" Or word = "with") And previous <> "end" And previous <> "exit" And previous <> "continue" Then blocks += 1
+            If endHead And (word = "if" Or word = "while" Or word = "select" Or word = "try" Or word = "with") Or statementHead And (word = "next" Or word = "loop" Or word = "wend") Then blocks = Math.Max(0, blocks - 1)
+        End If
+        token.BlockDepth = blocks
+        token.Owner = owner
+        token.Scope = scope
+        token.Layout = layout
+        If previous = "end" Then
+            If word = "class" Then owner = ""
+            If word = "sub" Or word = "function" Or word = "handle" Then
+                scope = 0
+                blocks = 0
+            End If
+            If word = "control" Then controls -= 1
+            If word = "window" Or word = "view" Then
+                If controls <> 0 Then LRFail("unbalanced layout")
+                layout = ""
+            End If
+        End If
+    Next
+    If owner <> "" Or layout <> "" Then LRFail("unclosed declaration")
+End Sub
+
+Private Function LRFind(types As Array Of LRType, name As String) As LRType
+    For Each record As LRType In types
+        If record.Name = LRLower(name) Then Return record
+    Next
+    Return Nil
+End Function
+
+Private Function LRModule(id As String) As String
+    Dim normalized As String = String.Replace(id, "\\", "/", True)
+    Dim pieces As Array Of String = String.Split(normalized, "/")
+    Dim leaf As String = Array.Last(pieces)
+    If String.EndsWith(LRLower(leaf), ".bui") Then leaf = String.SubstringBytes(leaf, 0, String.LenBytes(leaf) - 4)
+    Return LRLower(leaf)
+End Function
+
+' Only direct basic module imports prove an unqualified cross-file type.
+Private Function LRVisible(buffer As LRBuffer, record As LRType) As Boolean
+    If record = Nil Then Return False
+    If buffer.Id = record.BufferId Then Return True
+    Dim tokens As Array Of LRToken = buffer.Tokens
+    For i As Integer = 0 To Array.Count(tokens) - 2
+        If LRLower(tokens(i).Text) <> "import" Or tokens(i).Owner <> "" Then Continue For
+        If tokens(i + 1).Quoted Then Continue For
+        If LRLower(tokens(i + 1).Text) <> LRModule(record.BufferId) Then Continue For
+        If i + 2 < Array.Count(tokens) Then
+            If tokens(i + 2).Line = tokens(i).Line Then Continue For
+        End If
+        Return True
+    Next
+    Return False
+End Function
+
+' Empty = definitely independent; ? = inheritance is outside the registered sources.
+Private Function LRRoot(types As Array Of LRType, name As String) As String
+    Dim current As String = LRLower(name)
+    For depth As Integer = 0 To Array.Count(types)
+        If current = "" Then Return ""
+        Dim record As LRType = LRFind(types, current)
+        If record = Nil Then
+            If current = "window" Or current = "view" Or current = "button" Or current = "canvas" Then Return ""
+            Return "?"
+        End If
+        If record.Root Then Return record.Name
+        current = record.Base
+    Next
+    LRFail("inheritance cycle")
+    Return "?"
+End Function
+
+Private Function LRCovered(edits As Array Of EditorEdit, token As LRToken) As Boolean
+    For Each edit As EditorEdit In edits
+        If token.First >= edit.StartByte And token.Last <= edit.EndByte Then Return True
+    Next
+    Return False
+End Function
+
+Private Function LRDeclared(tokens As Array Of LRToken, index As Integer) As Boolean
+    If index + 1 < Array.Count(tokens) Then
+        If LRLower(tokens(index + 1).Text) = "as" Then Return True
+    End If
+    If index = 0 Then Return False
+    Dim previous As String = LRLower(tokens(index - 1).Text)
+    Return previous = "dim" Or previous = "var" Or previous = "const" Or previous = "property" Or previous = "function" Or previous = "sub" Or previous = "event" Or previous = "class"
+End Function
+
+' Receivers are restricted to an explicit local/parameter type in the same procedure.
+' Duplicate declarations anywhere in that procedure fail, including nested scopes.
+Private Function LRReceiver(buffer As LRBuffer, receiver As LRToken, types As Array Of LRType) As String
+    Dim found As String = "?"
+    Dim matches As Integer = 0
+    Dim tokens As Array Of LRToken = buffer.Tokens
+    For i As Integer = 0 To Array.Count(tokens) - 3
+        Dim candidate As LRToken = tokens(i)
+        If candidate.Owner <> receiver.Owner Or candidate.Scope <> receiver.Scope Then Continue For
+        If LRLower(candidate.Text) <> LRLower(receiver.Text) Then Continue For
+        If Not LRDeclared(tokens, i) Then Continue For
+        matches += 1
+        If LRLower(tokens(i + 1).Text) <> "as" Then Continue For
+        Dim typeIndex As Integer = i + 2
+        If LRLower(tokens(typeIndex).Text) = "new" Then typeIndex += 1
+        If typeIndex + 1 >= Array.Count(tokens) Then Continue For
+        If tokens(typeIndex + 1).Text = "." Or LRLower(tokens(typeIndex + 1).Text) = "of" Then Continue For
+        found = LRRoot(types, tokens(typeIndex).Text)
+        ' A later declaration does not prove an earlier use.
+        If candidate.First > receiver.First Or candidate.BlockDepth > 0 Then found = "?"
+        Dim declaredType As LRType = LRFind(types, tokens(typeIndex).Text)
+        If declaredType <> Nil Then
+            If Not LRVisible(buffer, declaredType) Then found = "?"
+        End If
+    Next
+    If matches <> 1 Then Return "?"
+    Return found
+End Function
+
+Private Sub LRReference(buffer As LRBuffer, types As Array Of LRType, rootName As String, oldName As String, newName As String, deleting As Boolean)
+    Dim tokens As Array Of LRToken = buffer.Tokens
+    For i As Integer = 0 To Array.Count(tokens) - 1
+        Dim token As LRToken = tokens(i)
+        If LRCovered(buffer.Edits, token) Then Continue For
+        Dim word As String = LRLower(token.Text)
+        Dim related As Boolean = LRRoot(types, token.Owner) = rootName
+        If token.Quoted Then
+            If token.Layout <> "" Then Continue For
+            ' Import paths are static module identities, not reflective member lookups.
+            If i > 0 Then
+                If LRLower(tokens(i - 1).Text) = "import" Then Continue For
+            End If
+            Dim decoded As Optional Of JSONItem = Json.TryParse(token.Text)
+            If Not decoded.HasValue Then LRFail("unproven string")
+            If String.Contains(LRLower(decoded.Value.AsString().Value), oldName) Then LRFail("possible dynamic control reference in string")
+            Continue For
+        End If
+        If String.StartsWith(word, oldName + "_") Or String.StartsWith(word, "__" + rootName + "_" + oldName) Then LRFail("generated event hook or bound type requires semantic rename")
+        If Not deleting And word = LRLower(newName) And word <> oldName Then LRFail("destination identifier already occurs in project source")
+        If related And (word = oldName Or word = LRLower(newName)) And LRDeclared(tokens, i) Then LRFail("control identifier shadow or destination collision")
+        If word <> oldName Then Continue For
+        If token.Layout <> "" Then
+            If token.Layout = rootName Then LRFail("unproven layout reference")
+            Dim independent As Boolean = False
+            For Each candidate As LayoutNode In buffer.Model.Nodes
+                If LRLower(candidate.Name) <> oldName Or candidate.ParentId = "" Then Continue For
+                Dim ancestor As LayoutNode = candidate
+                While ancestor.ParentId <> ""
+                    ancestor = buffer.Model.FindNode(ancestor.ParentId)
+                    If ancestor = Nil Then LRFail("broken layout identity")
+                End While
+                If LRLower(ancestor.Name) = token.Layout Then independent = True
+            Next
+            If i > 0 Then
+                If tokens(i - 1).Text = "." Then independent = False
+            End If
+            If Not independent Then LRFail("unproven reference in another layout")
+            Continue For
+        End If
+        Dim target As String = "?"
+        If i >= 2 And tokens(i - 1).Text = "." Then
+            Dim receiver As LRToken = tokens(i - 2)
+            Dim receiverWord As String = LRLower(receiver.Text)
+            If receiver.Line <> token.Line Then
+                LRFail("leading-dot reference requires semantic With resolution")
+            End If
+            If i >= 3 Then
+                If tokens(i - 3).Text = "." Or tokens(i - 3).Text = "?" Then LRFail("chained receiver requires semantic resolution")
+            End If
+            If receiverWord = "me" Or receiverWord = "super" Then
+                target = LRRoot(types, token.Owner)
+            Else
+                ' Never treat a chained member/index/call receiver as a local variable.
+                Dim simple As Boolean = LRWord(String.Asc(String.SubstringBytes(receiver.Text, 0, 1)), True)
+                If simple Then target = LRReceiver(buffer, receiver, types)
+            End If
+        ElseIf i > 0 And LRLower(tokens(i - 1).Text) = "with" And related Then
+            If i + 1 >= Array.Count(tokens) Then LRFail("incomplete With")
+            If tokens(i + 1).Line = token.Line Then LRFail("complex With receiver")
+            target = rootName
+        ElseIf Not related Then
+            ' A declaration and its bare uses in a definitely unrelated class are independent.
+            If token.Owner <> "" And LRRoot(types, token.Owner) <> "?" Then Continue For
+            If token.Owner = "" Then Continue For
+            If LRDeclared(tokens, i) Then Continue For
+        End If
+        If target = "?" Then LRFail("ambiguous reference: " + token.Text)
+        If target <> rootName Then Continue For
+        If deleting Then LRFail("live reference prevents deletion: " + token.Text)
+        Array.Append(buffer.Edits, New EditorEdit(token.First, token.Last, newName))
+    Next
+End Sub
+
+' Conservative subset: direct basic imports and unique project type/module names;
+' no aliases, qualified/generic bases, conditional source, namespaces, partial
+' type collisions, inferred/chained receivers or nested local receiver declarations.
+' Bare inherited uses, shadows, leading-dot members and potential name strings fail
+' closed. Pass every registered source buffer; omitted/external source is not known.
+' Pure planner. All spans refer to supplied original UTF-8 buffers. No files, editor
+' documents, versions, handlers or source strings are mutated by this service.
+Public Class LayoutProjectRefactor
+    Public Function PlanRename(items As JSONItem, selectedItemId As String, nodeId As String, newName As String) As JSONItem
+        Return Me.Plan(items, selectedItemId, nodeId, newName, False)
+    End Function
+    Public Function PlanDelete(items As JSONItem, selectedItemId As String, nodeId As String) As JSONItem
+        Return Me.Plan(items, selectedItemId, nodeId, "", True)
+    End Function
+
+    Private Function Plan(items As JSONItem, selectedItemId As String, nodeId As String, newName As String, deleting As Boolean) As JSONItem
+        If items = Nil Then LRFail("missing buffers")
+        If Not items.IsArray() Then LRFail("buffers must be an array")
+        Dim buffers As Array Of LRBuffer = []
+        Dim types As Array Of LRType = []
+        Dim selected As LRBuffer
+        For i As Integer = 0 To items.Count() - 1
+            Dim item As JSONItem = items.ValueAt(i)
+            If Not item.IsObject() Then LRFail("invalid buffer")
+            If Not item.Value("id").IsString() Or Not item.Value("text").IsString() Or Not item.Value("version").IsNumber() Then LRFail("invalid buffer fields")
+            Dim buffer As New LRBuffer()
+            buffer.Id = item.Value("id").AsString().Value
+            buffer.Source = item.Value("text").AsString().Value
+            Dim version As Double = item.Value("version").AsNumber().Value
+            If version <> version Or version < 1 Or version > 9007199254740991.0 Or Math.Floor(version) <> version Then LRFail("invalid version")
+            buffer.Version = version
+            If buffer.Id = "" Then LRFail("empty buffer id")
+            For Each prior As LRBuffer In buffers
+                If prior.Id = buffer.Id Then LRFail("duplicate buffer id")
+                If LRModule(prior.Id) = LRModule(buffer.Id) Then LRFail("ambiguous module basename")
+            Next
+            buffer.Model = New LayoutDocument(buffer.Source, buffer.Version)
+            LRScan(buffer, types)
+            Array.Append(buffers, buffer)
+            If String.Compare(buffer.Id, selectedItemId, True) = 0 Then selected = buffer
+        Next
+        If selected = Nil Then LRFail("selected buffer absent")
+        ' Global duplicate type names and aliased symbols cannot be disambiguated by
+        ' this lexical resolver. Reject rather than infer ownership across imports.
+        For i As Integer = 0 To Array.Count(types) - 1
+            For j As Integer = i + 1 To Array.Count(types) - 1
+                If types(i).Name = types(j).Name Then LRFail("ambiguous project type name")
+            Next
+        Next
+        For Each buffer As LRBuffer In buffers
+            For i As Integer = 0 To Array.Count(buffer.Tokens) - 1
+                If LRLower(buffer.Tokens(i).Text) = "import" Then
+                    Dim j As Integer = i + 1
+                    While j < Array.Count(buffer.Tokens)
+                        If buffer.Tokens(j).Line <> buffer.Tokens(i).Line Then Exit While
+                        If LRLower(buffer.Tokens(j).Text) = "as" Then LRFail("import aliases require compiler symbol resolution")
+                        j += 1
+                    End While
+                End If
+            Next
+        Next
+        For Each record As LRType In types
+            If record.Root Or record.Base = "" Then Continue For
+            Dim parent As LRType = LRFind(types, record.Base)
+            If parent = Nil Then Continue For
+            For Each buffer As LRBuffer In buffers
+                If buffer.Id = record.BufferId And Not LRVisible(buffer, parent) Then LRFail("unproven imported base type")
+            Next
+        Next
+        Dim node As LayoutNode = selected.Model.FindNode(nodeId)
+        If node = Nil Then LRFail("stale or unknown node id")
+        If node.ParentId = "" Then LRFail("root refactor unsupported")
+        Dim root As LayoutNode = node
+        While root.ParentId <> ""
+            root = selected.Model.FindNode(root.ParentId)
+            If root = Nil Then LRFail("broken parent identity")
+        End While
+        If Not deleting Then
+            For Each candidate As LayoutNode In selected.Model.Nodes
+                If candidate.Id = node.Id Then Continue For
+                If String.StartsWith(LRLower(newName), LRLower(candidate.Name) + "_") Or String.StartsWith(LRLower(candidate.Name), LRLower(newName) + "_") Then LRFail("possible generated hook collision")
+            Next
+        End If
+        If deleting Then
+            selected.Edits = selected.Model.DeleteControlEdits(nodeId)
+        Else
+            selected.Edits = selected.Model.RenameControlEdits(nodeId, newName)
+        End If
+        If Not deleting And Array.Count(selected.Edits) = 0 Then Return JSONItem.NewArray()
+        Dim names As Array Of String = []
+        Array.Append(names, LRLower(node.Name))
+        If deleting Then
+            For Each child As LayoutNode In selected.Model.Nodes
+                If child.Id = node.Id Or child.ParentId = "" Then Continue For
+                Dim ancestor As LayoutNode = child
+                Dim descendant As Boolean = False
+                While ancestor.ParentId <> ""
+                    If ancestor.ParentId = node.Id Then
+                        descendant = True
+                        Exit While
+                    End If
+                    ancestor = selected.Model.FindNode(ancestor.ParentId)
+                    If ancestor = Nil Then LRFail("broken descendant identity")
+                End While
+                If descendant Then Array.Append(names, LRLower(child.Name))
+            Next
+        End If
+        For Each name As String In names
+            For Each buffer As LRBuffer In buffers
+                LRReference(buffer, types, LRLower(root.Name), name, newName, deleting)
+            Next
+        Next
+        Dim planned As JSONItem = JSONItem.NewArray()
+        For Each buffer As LRBuffer In buffers
+            If Array.Count(buffer.Edits) = 0 Then Continue For
+            ' Output ordered, nonoverlapping original spans, independent of traversal order.
+            Dim ordered As Array Of EditorEdit = []
+            For Each edit As EditorEdit In buffer.Edits
+                Dim position As Integer = 0
+                While position < Array.Count(ordered)
+                    If ordered(position).StartByte >= edit.StartByte Then Exit While
+                    position += 1
+                End While
+                Array.Insert(ordered, position, edit)
+            Next
+            Dim edits As JSONItem = JSONItem.NewArray()
+            Dim last As Integer = -1
+            For Each edit As EditorEdit In ordered
+                If edit.StartByte < last Then LRFail("overlapping edits")
+                last = edit.EndByte
+                Dim encoded As JSONItem = JSONItem.NewObject()
+                encoded.Value("startByte") = edit.StartByte
+                encoded.Value("endByte") = edit.EndByte
+                encoded.Value("replacement") = edit.Replacement
+                edits.Add(encoded)
+            Next
+            Dim changed As JSONItem = JSONItem.NewObject()
+            changed.Value("id") = buffer.Id
+            changed.Value("version") = buffer.Version
+            changed.Value("edits") = edits
+            planned.Add(changed)
+        Next
+        Return planned
+    End Function
+End Class

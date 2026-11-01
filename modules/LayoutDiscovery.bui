@@ -1,0 +1,730 @@
+Import layoutkit.LayoutCatalog
+Import layoutkit.LayoutDocument
+
+Private Sub Require(valid As Boolean, message As String)
+    If Not valid Then Throw New InvalidArgumentException(message)
+End Sub
+
+Private Function Text(item As JSONItem, key As String, fallback As String = "") As String
+    Return item.Value(key).AsString().Or(fallback)
+End Function
+
+Private Function Number(item As JSONItem, key As String, fallback As Double = 0.0) As Double
+    Return item.Value(key).AsNumber().Or(fallback)
+End Function
+
+Private Function Symbol(name As String) As Boolean
+    If String.Len(name) = 0 Or String.Len(name) > 64 Then Return False
+    Dim position As Integer = 0
+    For Each ch As String In String.Chars(name)
+        Dim letter As Boolean = (ch >= "a" And ch <= "z") Or (ch >= "A" And ch <= "Z") Or ch = "_"
+        If Not letter And (position = 0 Or ch < "0" Or ch > "9") Then Return False
+        position += 1
+    Next
+    Return True
+End Function
+
+Private Function Qualified(name As String) As Boolean
+    If String.Len(name) > 256 Then Return False
+    Dim parts As Array Of String = String.Split(name, ".")
+    If Array.Count(parts) < 2 Then Return False
+    For Each part As String In parts
+        If Not Symbol(part) Then Return False
+    Next
+    Return True
+End Function
+
+Private Function SafeText(value As JSONItem, limit As Integer = 256) As Boolean
+    If Not value.IsString() Then Return False
+    Dim content As String = value.AsString().Or("")
+    If String.Len(content) > limit Then Return False
+    For Each ch As String In String.Chars(content)
+        If String.Asc(ch) < 32 Then Return False
+    Next
+    Return True
+End Function
+
+Private Function Bounded(item As JSONItem, depth As Integer = 0) As Integer
+    Require(item IsNot Nil And depth <= 24, "Metadata nesting exceeds 24")
+    Dim count As Integer = 1
+    If item.IsArray() Then
+        Require(item.Count() <= 16384, "Metadata array too large")
+        For i As Integer = 0 To item.Count() - 1
+            count += Bounded(item.ValueAt(i), depth + 1)
+            Require(count <= 65536, "Metadata too large")
+        Next
+    ElseIf item.IsObject() Then
+        Require(item.Count() <= 1024, "Metadata object too large")
+        For Each key As String In item.Keys()
+            Require(String.Len(key) <= 256, "Metadata key too long")
+            Dim child As JSONItem = item.Value(key)
+            ' Embedded icon PNGs are the one long string; IconPngData validates them.
+            If key = "iconImageData" And child.IsString() Then
+                Require(String.Len(child.AsString().Or("")) <= 87384, "Icon image data too large")
+                count += 1
+                Continue For
+            End If
+            count += Bounded(child, depth + 1)
+            Require(count <= 65536, "Metadata too large")
+        Next
+    ElseIf item.IsString() Then
+        Require(String.Len(item.AsString().Or("")) <= 4096, "Metadata string too long")
+    ElseIf item.IsNumber() Then
+        Dim n As Double = item.AsNumber().Or(0.0)
+        Require(n = n And n <> Double.Infinity And n <> -Double.Infinity, "Nonfinite metadata number")
+    End If
+    Return count
+End Function
+
+Private Function ParseBounded(source As String, limit As Integer) As JSONItem
+    ' The limit is in UTF-8 bytes, matching the bounded file reads below.
+    Require(String.LenBytes(source) <= limit, "JSON exceeds size limit")
+    Dim depth As Integer = 0
+    Dim quoted As Boolean = False
+    Dim escaped As Boolean = False
+    For Each ch As String In String.Chars(source)
+        If quoted Then
+            If escaped Then
+                escaped = False
+            ElseIf ch = "\\" Then
+                escaped = True
+            ElseIf ch = "\"" Then
+                quoted = False
+            End If
+        ElseIf ch = "\"" Then
+            quoted = True
+        ElseIf ch = "{" Or ch = "[" Then
+            depth += 1
+            Require(depth <= 32, "JSON nesting exceeds 32")
+        ElseIf ch = "}" Or ch = "]" Then
+            depth -= 1
+        End If
+    Next
+    Return Json.Parse(source)
+End Function
+
+''' Reads at most limit bytes of a regular file and rejects anything longer.
+''' IsFile follows symlinks and is False for FIFOs, devices and folders, so a
+''' pipe or /dev/zero link present at check time is refused before opening; the
+''' capped read bounds a file that grows or becomes an endless device after that
+''' check. (A path swapped to a FIFO in the instant between the check and the
+''' open can still block the open; Buoy has no non-blocking open.)
+Private Function ReadBounded(location As String, limit As Integer, what As String) As Bytes
+    Dim file As New FileSystemItem(location)
+    Require(file.IsFile(), what + " is not a regular file")
+    Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(file, False)
+    Require(opened.IsOk, "Cannot read " + what)
+    Dim stream As BinaryStream = opened.Value
+    Dim data As Bytes
+    Try
+        data = stream.Read(limit + 1)
+    Finally
+        stream.Close()
+    End Try
+    Require(data IsNot Nil, "Cannot read " + what)
+    Require(data.Count <= limit, what + " exceeds " + String.From(limit) + " bytes")
+    Return data
+End Function
+
+Private Function ReadBoundedText(location As String, limit As Integer, what As String) As String
+    Return ReadBounded(location, limit, what).ToString(Text.Encodings.UTF8)
+End Function
+
+Private Function BigEndian32(data As Bytes, offset As Integer) As Integer
+    Return ((data.Item(offset) * 256 + data.Item(offset + 1)) * 256 + data.Item(offset + 2)) * 256 + data.Item(offset + 3)
+End Function
+
+''' Byte-level icon check run before any decode: 33 bytes..64 KiB, the PNG
+''' signature followed by a 13-byte IHDR chunk, and IHDR width/height 1..512.
+''' Returns "" when acceptable, else the rejection message.
+Private Function PngProblem(data As Bytes) As String
+    If data Is Nil Then Return "Invalid icon image size"
+    If data.Count < 33 Or data.Count > 65536 Then Return "Invalid icon image size"
+    Dim signature As Array Of Integer = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82]
+    For i As Integer = 0 To Array.Count(signature) - 1
+        If data.Item(i) <> signature(i) Then Return "Icon image must be a PNG"
+    Next
+    Dim w As Integer = BigEndian32(data, 16)
+    Dim h As Integer = BigEndian32(data, 20)
+    If w < 1 Or h < 1 Or w > 512 Or h > 512 Then Return "Icon image must be at most 512x512"
+    Return ""
+End Function
+
+Private Function NewReport() As JSONItem
+    Dim reportItem As New JSONItem()
+    reportItem.Value("loadedControls") = 0.0
+    reportItem.Value("loadedPackages") = 0.0
+    reportItem.Value("errors") = JSONItem.NewArray()
+    Return reportItem
+End Function
+
+Private Sub MergeReport(destination As JSONItem, source As JSONItem)
+    destination.Value("loadedControls") = Number(destination, "loadedControls") + Number(source, "loadedControls")
+    destination.Value("loadedPackages") = Number(destination, "loadedPackages") + Number(source, "loadedPackages")
+    Dim errors As JSONItem = source.Value("errors")
+    For i As Integer = 0 To errors.Count() - 1
+        destination.Value("errors").Add(errors.ValueAt(i))
+    Next
+End Sub
+
+Private Sub Diagnostic(report As JSONItem, message As String, location As String = "")
+    Dim entry As New JSONItem()
+    entry.Value("message") = message
+    entry.Value("path") = location
+    report.Value("errors").Add(entry)
+End Sub
+
+Private Function PropertyFor(control As LayoutControlDescriptor, name As String) As LayoutPropertyDescriptor
+    For Each prop As LayoutPropertyDescriptor In control.Properties
+        If prop.Name = name Then Return prop
+    Next
+    Return Nil
+End Function
+
+Private Sub ValidateColor(value As JSONItem)
+    Require(value.IsArray() And value.Count() = 3, "RGB requires three components")
+    For i As Integer = 0 To 2
+        Dim part As JSONItem = value.ValueAt(i)
+        Require(part.IsNumber(), "RGB components must be numeric")
+        Dim n As Double = part.AsNumber().Or(-1.0)
+        Require(n >= 0.0 And n <= 1.0, "RGB component out of range")
+    Next
+End Sub
+
+''' Shared by renderer and icon recipes. Geometry fields: x/y offset the step,
+''' inset shrinks it on every side, width/height (when present) replace the
+''' inset-derived size. darkColor replaces color in the dark appearance.
+Private Function RecipeOperations() As Array Of String
+    Return ["fillRect", "fillRoundedRect", "strokeRect", "strokeRoundedRect", "fillOval", "strokeOval", "text"]
+End Function
+
+Private Sub ValidateRecipe(recipe As JSONItem, control As LayoutControlDescriptor)
+    Require(recipe.IsObject() And Number(recipe, "version") = 1.0, "Unsupported renderer version")
+    Dim steps As JSONItem = recipe.Value("steps")
+    Require(steps.IsArray() And steps.Count() > 0 And steps.Count() <= 64, "Expected 1..64 renderer steps")
+    For i As Integer = 0 To steps.Count() - 1
+        Dim stepItem As JSONItem = steps.ValueAt(i)
+        Require(stepItem.IsObject(), "Renderer step must be an object")
+        Require(Array.Contains(RecipeOperations(), Text(stepItem, "op"), True), "Unsupported renderer operation")
+        For Each key As String In stepItem.Keys()
+            Require(Array.Contains(["op", "color", "darkColor", "x", "y", "inset", "width", "height", "radius", "lineWidth", "size", "prefix", "suffix", "property", "whenProperty", "equals", "elseColor"], key, True), "Unknown renderer field")
+        Next
+        ValidateColor(stepItem.Value("color"))
+        If stepItem.HasKey("elseColor") Then ValidateColor(stepItem.Value("elseColor"))
+        If stepItem.HasKey("darkColor") Then ValidateColor(stepItem.Value("darkColor"))
+        For Each key As String In ["x", "y", "inset", "width", "height", "radius", "size"]
+            If stepItem.HasKey(key) Then
+                Dim n As Double = Number(stepItem, key, -1.0)
+                Require(n >= 0.0 And n <= 1024.0, "Invalid renderer geometry")
+            End If
+        Next
+        If stepItem.HasKey("lineWidth") Then
+            Dim n As Double = Number(stepItem, "lineWidth", -1.0)
+            Require(n > 0.0 And n <= 64.0, "Invalid renderer line width")
+        End If
+        For Each key As String In ["prefix", "suffix"]
+            If stepItem.HasKey(key) Then Require(SafeText(stepItem.Value(key), 1024), "Invalid renderer text")
+        Next
+        For Each key As String In ["property", "whenProperty"]
+            If stepItem.HasKey(key) Then Require(PropertyFor(control, Text(stepItem, key)) IsNot Nil, "Unknown renderer property")
+        Next
+        If stepItem.HasKey("whenProperty") Then
+            Dim prop As LayoutPropertyDescriptor = PropertyFor(control, Text(stepItem, "whenProperty"))
+            Require(prop.ValidateExpression(Text(stepItem, "equals")) And stepItem.HasKey("elseColor"), "Invalid renderer condition")
+        End If
+    Next
+End Sub
+
+''' Fixed interpreter: no source evaluation, FFI, package callbacks, or control construction.
+Public Class LayoutRecipeRenderer Implements LayoutRenderer
+    Private Property mControl As LayoutControlDescriptor
+    Private Property mRecipe As JSONItem
+    Public Sub Constructor(control As LayoutControlDescriptor, recipe As JSONItem)
+        Me.mControl = control
+        Me.mRecipe = Json.Parse(Json.Stringify(recipe))
+    End Sub
+    Public Function RendererId() As String
+        Return Me.mControl.TypeName + ".recipe.v1"
+    End Function
+    Private Function Expression(name As String, values As JSONItem) As String
+        Dim prop As LayoutPropertyDescriptor = PropertyFor(Me.mControl, name)
+        If prop Is Nil Then Return ""
+        If values IsNot Nil Then
+            Dim proposed As String = ""
+            Dim expressions As JSONItem = values.Value("$expressions")
+            If expressions.IsObject() And expressions.HasKey(name) Then
+                proposed = Text(expressions, name)
+                ' Explicit unresolved source suppresses defaults; never evaluate it.
+                If Not prop.ValidateExpression(proposed) Then Return proposed
+            ElseIf values.HasKey(name) Then
+                If prop.Kind = "string" Then
+                    proposed = Json.Stringify(values.Value(name))
+                ElseIf prop.Kind = "boolean" Then
+                    proposed = "False"
+                    If values.Value(name).AsBoolean().Or(False) Then proposed = "True"
+                Else
+                    proposed = Json.Stringify(values.Value(name))
+                End If
+            End If
+            If prop.ValidateExpression(proposed) Then
+                If Array.Count(prop.Options) = 0 Or Array.Contains(prop.Options, proposed, True) Then Return proposed
+            End If
+        End If
+        Return prop.DefaultExpression
+    End Function
+    Public Sub Paint(g As IGraphics, x As Double, y As Double, width As Double, height As Double, values As JSONItem, selected As Boolean)
+        If g Is Nil Then Return
+        Dim dark As Boolean = False
+        If values IsNot Nil Then dark = Text(values, "$appearance") = "dark"
+        g.Save()
+        Try
+            g.ClipToRect(x, y, Math.Max(0.0, width), Math.Max(0.0, height))
+            Dim steps As JSONItem = Me.mRecipe.Value("steps")
+            For i As Integer = 0 To steps.Count() - 1
+                Dim stepItem As JSONItem = steps.ValueAt(i)
+                Dim rgb As JSONItem = stepItem.Value("color")
+                If stepItem.HasKey("whenProperty") Then
+                    If Me.Expression(Text(stepItem, "whenProperty"), values) <> Text(stepItem, "equals") Then rgb = stepItem.Value("elseColor")
+                End If
+                ' darkColor overrides either light conditional branch.
+                If dark And stepItem.HasKey("darkColor") Then rgb = stepItem.Value("darkColor")
+                Dim color As Color = Color.RGB(rgb.ValueAt(0).AsNumber().Or(0.0), rgb.ValueAt(1).AsNumber().Or(0.0), rgb.ValueAt(2).AsNumber().Or(0.0))
+                Dim inset As Double = Number(stepItem, "inset")
+                Dim left As Double = x + Number(stepItem, "x") + inset
+                Dim top As Double = y + Number(stepItem, "y") + inset
+                Dim w As Double = Math.Max(0.0, width - 2.0 * inset)
+                Dim h As Double = Math.Max(0.0, height - 2.0 * inset)
+                If stepItem.HasKey("width") Then w = Number(stepItem, "width")
+                If stepItem.HasKey("height") Then h = Number(stepItem, "height")
+                Dim lineWidth As Double = Number(stepItem, "lineWidth", 1.0)
+                Select Case Text(stepItem, "op")
+                    Case "fillRect"
+                        g.FillRect(left, top, w, h, color)
+                    Case "fillRoundedRect"
+                        g.FillRoundedRect(left, top, w, h, Number(stepItem, "radius", 8.0), color)
+                    Case "strokeRect"
+                        g.StrokeRect(left, top, w, h, lineWidth, color)
+                    Case "strokeRoundedRect"
+                        g.StrokeRoundedRect(left, top, w, h, Number(stepItem, "radius", 8.0), lineWidth, color)
+                    Case "fillOval"
+                        g.BeginPath()
+                        g.FillOval(left, top, w, h, color)
+                    Case "strokeOval"
+                        g.BeginPath()
+                        g.StrokeOval(left, top, w, h, lineWidth, color)
+                    Case "text"
+                        Dim value As String = Me.Expression(Text(stepItem, "property"), values)
+                        Dim parsed As Optional Of JSONItem = Json.TryParse(value)
+                        If parsed.HasValue Then
+                            If parsed.Value.IsString() Then value = parsed.Value.AsString().Or("")
+                        End If
+                        g.DrawString(Text(stepItem, "prefix") + value + Text(stepItem, "suffix"), left, top, "", Number(stepItem, "size", 13.0), color)
+                End Select
+            Next
+            If selected Then
+                Dim selectionColor As Color = Color.Black
+                If dark Then selectionColor = Color.White
+                g.StrokeRect(x, y, width, height, 2.0, selectionColor)
+            End If
+        Finally
+            g.Restore()
+        End Try
+    End Sub
+End Class
+
+''' Data-only icon: the shared recipe interpreter painted into a 24x24 design grid
+''' scaled to the requested size and clipped to the icon square.
+Public Class LayoutRecipeIconPainter Implements LayoutIconPainter
+    Private Property mRenderer As LayoutRecipeRenderer
+    Public Sub Constructor(control As LayoutControlDescriptor, recipe As JSONItem)
+        Me.mRenderer = New LayoutRecipeRenderer(control, recipe)
+    End Sub
+    Public Sub PaintIcon(g As IGraphics, x As Double, y As Double, size As Double, dark As Boolean)
+        If g Is Nil Or Not (size > 0.0) Then Return
+        Dim values As JSONItem = JSONItem.NewObject()
+        values.Value("$appearance") = "light"
+        If dark Then values.Value("$appearance") = "dark"
+        values.Value("$expressions") = JSONItem.NewObject()
+        g.Save()
+        Try
+            g.ClipToRect(x, y, size, size)
+            g.Translate(x, y)
+            g.Scale(size / 24.0, size / 24.0)
+            Me.mRenderer.Paint(g, 0.0, 0.0, 24.0, 24.0, values, False)
+        Finally
+            g.Restore()
+        End Try
+    End Sub
+End Class
+
+''' Package-supplied PNG icon (decoded lazily on first paint, never executed). Falls
+''' back to the declarative or generic icon when the image cannot be decoded.
+''' Holds the bytes, never a path: only PNG-signed data with an IHDR of at most
+''' 512x512 is ever decoded, and only with the PNG decoder.
+Public Class LayoutImageIconPainter Implements LayoutIconPainter
+    Private Property mData As Bytes
+    Private Property mPicture As Picture
+    Private Property mAttempted As Boolean = False
+    Private Property mFallback As LayoutIconPainter
+
+    ''' data holds PNG bytes (re-validated before decoding).
+    Public Sub Constructor(data As Bytes, fallback As LayoutIconPainter)
+        Me.mData = data
+        Me.mFallback = fallback
+        If Me.mFallback Is Nil Then Me.mFallback = New LayoutGlyphIcon("package")
+    End Sub
+
+    ''' Compatibility form. A non-empty filePath is read once, now, with a 64 KiB
+    ''' bounded read and the same PNG checks; an unusable file paints the fallback.
+    Public Sub Constructor(data As Bytes, filePath As String, fallback As LayoutIconPainter)
+        Me.mData = data
+        If data Is Nil And filePath <> "" Then
+            Try
+                Me.mData = ReadBounded(filePath, 65536, "iconImage")
+            Catch e As Exception
+                Me.mData = Nil
+            End Try
+        End If
+        Me.mFallback = fallback
+        If Me.mFallback Is Nil Then Me.mFallback = New LayoutGlyphIcon("package")
+    End Sub
+
+    Public Function IsLoaded() As Boolean
+        Return Me.Load() IsNot Nil
+    End Function
+
+    Private Function Load() As Picture
+        If Me.mAttempted Then Return Me.mPicture
+        Me.mAttempted = True
+        Dim loaded As Picture
+        ' Only signature/IHDR-checked PNG bytes reach the PNG-only decoder.
+        If Me.mData IsNot Nil Then
+            If PngProblem(Me.mData) = "" Then loaded = Picture.FromPNG(Me.mData)
+        End If
+        If loaded IsNot Nil Then
+            If loaded.Width < 1 Or loaded.Height < 1 Or loaded.Width > 512 Or loaded.Height > 512 Then loaded = Nil
+        End If
+        Me.mPicture = loaded
+        Return loaded
+    End Function
+
+    Public Sub PaintIcon(g As IGraphics, x As Double, y As Double, size As Double, dark As Boolean)
+        If g Is Nil Or Not (size > 0.0) Then Return
+        Dim image As Picture = Me.Load()
+        If image Is Nil Then
+            Me.mFallback.PaintIcon(g, x, y, size, dark)
+        Else
+            g.DrawPicture(image, x, y, size, size)
+        End If
+    End Sub
+End Class
+
+''' Validates base64 PNG bytes: at most 64 KiB, PNG signature, IHDR <= 512x512.
+Private Function IconPngData(encoded As JSONItem) As Bytes
+    Require(encoded.IsString(), "Icon image data must be a base64 string")
+    Dim text As String = encoded.AsString().Or("")
+    Require(String.Len(text) <= 87384, "Icon image exceeds 64 KiB")
+    Dim decoded As Result Of Bytes, String = Bytes.FromBase64(text)
+    Require(decoded.IsOk, "Invalid icon image encoding")
+    Dim data As Bytes = decoded.Value
+    Dim problem As String = PngProblem(data)
+    Require(problem = "", problem)
+    Return data
+End Function
+
+''' A relative .png path inside resources/buoy-designer: no traversal or odd characters.
+Private Function IconImagePath(value As JSONItem) As String
+    Require(SafeText(value, 128), "Invalid iconImage path")
+    Dim location As String = value.AsString().Or("")
+    Require(String.EndsWith(String.LCase(location), ".png"), "iconImage must be a .png file")
+    For Each part As String In String.Split(location, "/")
+        Require(part <> "" And part <> "." And part <> "..", "Invalid iconImage path")
+        For Each ch As String In String.Chars(part)
+            Require((ch >= "a" And ch <= "z") Or (ch >= "A" And ch <= "Z") Or (ch >= "0" And ch <= "9") Or ch = "_" Or ch = "-" Or ch = ".", "Invalid iconImage path")
+        Next
+    Next
+    Return location
+End Function
+
+''' Builds (without registering) a control's icon from icon/iconImage/iconImageData.
+''' Returns Nil when the control declares no icon.
+Private Function StageIcon(item As JSONItem, control As LayoutControlDescriptor, resourceRoot As String) As LayoutIconPainter
+    Dim declared As LayoutIconPainter
+    If item.HasKey("icon") Then
+        Dim icon As JSONItem = item.Value("icon")
+        If icon.IsString() Then
+            Require(SafeText(icon, 64) And Text(item, "icon") <> "", "Invalid icon glyph name")
+            declared = New LayoutGlyphIcon(Text(item, "icon"))
+        Else
+            Require(icon.IsObject(), "icon must be a glyph name or recipe object")
+            ValidateRecipe(icon, control)
+            declared = New LayoutRecipeIconPainter(control, icon)
+        End If
+    End If
+    Dim location As String = ""
+    If item.HasKey("iconImage") Then location = IconImagePath(item.Value("iconImage"))
+    If item.HasKey("iconImageData") Then
+        Return New LayoutImageIconPainter(IconPngData(item.Value("iconImageData")), "", declared)
+    End If
+    If location <> "" And resourceRoot <> "" Then
+        Dim file As New FileSystemItem(Path.Join(resourceRoot, location))
+        ' A missing image is not fatal: the declarative or generic icon remains
+        ' (as in tools/discover_layout_packages.py). A present but non-regular,
+        ' oversized or non-PNG file rejects the descriptor like bad iconImageData.
+        ' The bytes are read once here, so the file cannot change before painting.
+        If file.Exists() Then
+            Dim data As Bytes = ReadBounded(file.FullPath(), 65536, "iconImage")
+            Dim problem As String = PngProblem(data)
+            Require(problem = "", problem)
+            Return New LayoutImageIconPainter(data, declared)
+        End If
+    End If
+    Return declared
+End Function
+
+Private Class DiscoveryChoiceButton Inherits Button
+    Public Property Host As LayoutPropertyEditorHost
+    Public Property Expression As String
+    Handle Action()
+        If Me.Host IsNot Nil Then Me.Host.CommitExpression(Me.Expression)
+    End Handle
+End Class
+
+''' Generic native choice editor; all commits pass through the host's revision gate.
+Public Class LayoutChoiceView Inherits View Implements LayoutReusablePropertyViewV1
+    Private Property mButtons As Array Of DiscoveryChoiceButton = []
+    Public Sub Constructor(options As Array Of String, currentExpression As String, host As LayoutPropertyEditorHost)
+        Super.Constructor()
+        Me.Move(0, 0, 240, 32 * Array.Count(options))
+        For Each expression As String In options
+            Dim button As New DiscoveryChoiceButton()
+            button.Caption = expression
+            button.Expression = expression
+            button.Host = host
+            button.Move(0, Array.Count(Me.mButtons) * 32, 230, 28)
+            Me.AddSubview(button)
+            Array.Append(Me.mButtons, button)
+        Next
+    End Sub
+    Public Sub RebindProperty(currentExpression As String, host As LayoutPropertyEditorHost)
+        For Each button As DiscoveryChoiceButton In Me.mButtons
+            button.Host = host
+        Next
+    End Sub
+    Public Sub PerformChoice(expression As String)
+        For Each button As DiscoveryChoiceButton In Me.mButtons
+            If button.Expression = expression Then button.PerformClick()
+        Next
+    End Sub
+End Class
+
+Public Class LayoutChoiceFactory Implements LayoutPropertyViewFactory
+    Private Property mId As String
+    Private Property mOptions As Array Of String
+    Public Sub Constructor(id As String, options As Array Of String)
+        Me.mId = id
+        Me.mOptions = Array.Clone(options)
+    End Sub
+    Public Function EditorId() As String
+        Return Me.mId
+    End Function
+    Public Function CreateView(currentExpression As String, host As LayoutPropertyEditorHost) As View
+        Return New LayoutChoiceView(Me.mOptions, currentExpression, host)
+    End Function
+End Class
+
+''' Data-only discovery. Refresh the index with discover_layout_packages.py before
+''' startup discovery; this module intentionally has no native ZIP dependency.
+Public Class LayoutDiscovery
+    Public Sub Constructor()
+    End Sub
+
+    Public Function ImportDescriptor(descriptor As JSONItem, catalog As LayoutCatalog) As JSONItem
+        Return Me.ImportFrom(descriptor, catalog, "")
+    End Function
+
+    ''' resourceRoot is the unpacked resources/buoy-designer directory used to resolve
+    ''' iconImage paths; empty for index/in-memory descriptors (which embed
+    ''' iconImageData instead).
+    Private Function ImportFrom(descriptor As JSONItem, catalog As LayoutCatalog, resourceRoot As String) As JSONItem
+        Dim report As JSONItem = NewReport()
+        Try
+            Require(catalog IsNot Nil, "Catalog required")
+            Dim count As Integer = Bounded(descriptor)
+            Require(String.Len(Json.Stringify(descriptor)) <= 1048576, "Descriptor exceeds 1 MiB")
+            ' Clone first: callers cannot mutate validated recipe/metadata afterwards.
+            Dim data As JSONItem = Json.Parse(Json.Stringify(descriptor))
+            Require(Text(data, "schema") = "buoy.designer.plugin" And Number(data, "schemaVersion") = 1.0, "Unsupported descriptor schema/version")
+            Dim packageInfo As JSONItem = data.Value("package")
+            Dim packageName As String = Text(packageInfo, "name")
+            Require(Symbol(packageName) And packageName = String.LCase(packageName) And String.Left(packageName, 1) >= "a" And String.Left(packageName, 1) <= "z", "Invalid package name")
+            Dim version As String = Text(packageInfo, "version")
+            Dim core As String = String.Split(version, "-")(0)
+            Dim components As Array Of String = String.Split(core, ".")
+            For Each ch As String In String.Chars(version)
+                Require((ch >= "0" And ch <= "9") Or (ch >= "a" And ch <= "z") Or (ch >= "A" And ch <= "Z") Or ch = "." Or ch = "-", "Invalid package version")
+            Next
+            If String.Len(version) > String.Len(core) Then Require(String.Len(version) > String.Len(core) + 1, "Empty package version suffix")
+            Require(Array.Count(components) = 3 And SafeText(packageInfo.Value("version")), "Invalid package version")
+            For Each component As String In components
+                Require(String.Len(component) > 0, "Invalid package version")
+                For Each ch As String In String.Chars(component)
+                    Require(ch >= "0" And ch <= "9", "Invalid package version")
+                Next
+            Next
+            Require(SafeText(packageInfo.Value("provenance"), 512) And Text(packageInfo, "provenance") <> "", "Package provenance required")
+            Dim controls As JSONItem = data.Value("controls")
+            Require(controls.IsArray() And controls.Count() > 0 And controls.Count() <= 128, "Expected 1..128 controls")
+            Dim staged As Array Of LayoutControlDescriptor = []
+            Dim recipes As Array Of JSONItem = []
+            Dim icons As Array Of LayoutIconPainter = []
+            Dim symbols As Array Of String = []
+            Dim editorIds As Array Of String = []
+            For Each existing As LayoutControlDescriptor In catalog.Controls()
+                Array.Append(symbols, String.LCase(existing.TypeName))
+            Next
+            For i As Integer = 0 To controls.Count() - 1
+                Dim item As JSONItem = controls.ValueAt(i)
+                Require(item.IsObject(), "Control must be an object")
+                Dim name As String = Text(item, "typeName")
+                Dim prefix As String = packageName + "."
+                Require(String.Left(name, String.Len(prefix)) = prefix And Symbol(String.Substring(name, String.Len(prefix))), "Control must use package.Type identity")
+                Require(Not Array.Contains(symbols, String.LCase(name), True), "Duplicate control symbol: " + name)
+                Array.Append(symbols, String.LCase(name))
+                Require(SafeText(item.Value("displayName")) And Text(item, "displayName") <> "", "Invalid display name")
+                Dim sourceImport As String = Text(item, "sourceImport")
+                Require(Qualified(sourceImport) And String.Left(sourceImport, String.Len(prefix)) = prefix, "Invalid sourceImport")
+                Dim control As New LayoutControlDescriptor(name, Text(item, "displayName"), packageName)
+                For Each key As String In ["defaultWidth", "defaultHeight"]
+                    Dim n As Double = Number(item, key, -1.0)
+                    Require(n >= 1.0 And n <= 16384.0 And Math.Floor(n) = n, "Invalid default geometry")
+                Next
+                control.DefaultWidth = Number(item, "defaultWidth")
+                control.DefaultHeight = Number(item, "defaultHeight")
+                control.Metadata.Value("sourceImport") = sourceImport
+                control.Metadata.Value("sourceTypeName") = String.Substring(name, String.Len(prefix))
+                control.Metadata.Value("package") = packageInfo
+                If item.HasKey("category") Then
+                    Require(SafeText(item.Value("category"), 64) And String.Trim(Text(item, "category")) <> "", "Invalid category")
+                    control.Category = Text(item, "category")
+                End If
+                If item.HasKey("description") Then
+                    Require(SafeText(item.Value("description")), "Invalid description")
+                    control.Description = Text(item, "description")
+                End If
+                Dim properties As JSONItem = item.Value("properties")
+                Require(properties.IsArray() And properties.Count() <= 128, "Invalid properties")
+                Dim propertyNames As Array Of String = []
+                For j As Integer = 0 To properties.Count() - 1
+                    Dim p As JSONItem = properties.ValueAt(j)
+                    Dim propName As String = Text(p, "name")
+                    Require(Symbol(propName) And LayoutWritablePropertyName(propName) And Not Array.Contains(propertyNames, String.LCase(propName), True), "Invalid or duplicate property symbol")
+                    Array.Append(propertyNames, String.LCase(propName))
+                    Dim prop As New LayoutPropertyDescriptor(propName, Text(p, "kind"), Text(p, "defaultExpression"))
+                    Require(Array.Contains(["string", "integer", "double", "boolean", "enum"], prop.Kind, True), "Unsupported property kind")
+                    If p.HasKey("options") Then
+                        Dim options As JSONItem = p.Value("options")
+                        Require(options.IsArray() And options.Count() <= 64, "Invalid choices")
+                        For k As Integer = 0 To options.Count() - 1
+                            Require(options.ValueAt(k).IsString(), "Choice must be an expression string")
+                            Dim expression As String = options.ValueAt(k).AsString().Or("")
+                            Require(Not Array.Contains(prop.Options, expression, True), "Duplicate choice")
+                            Dim choices As Array Of String = prop.Options
+                            Array.Append(choices, expression)
+                            prop.Options = choices
+                        Next
+                    End If
+                    Require(prop.ValidateExpression(prop.DefaultExpression), "Unsafe default expression")
+                    If Array.Count(prop.Options) > 0 Then Require(Array.Contains(prop.Options, prop.DefaultExpression, True), "Default must be a choice")
+                    For Each expression As String In prop.Options
+                        Require(prop.ValidateExpression(expression), "Unsafe choice expression")
+                        If prop.Kind = "enum" Then Require(String.Left(expression, String.Len(prefix)) = prefix, "Enum must be package-qualified")
+                    Next
+                    For Each key As String In ["displayName", "category"]
+                        If p.HasKey(key) Then Require(SafeText(p.Value(key)), "Invalid property text")
+                    Next
+                    prop.DisplayName = Text(p, "displayName", propName)
+                    prop.Category = Text(p, "category", "Properties")
+                    If p.HasKey("metadata") Then
+                        Require(p.Value("metadata").IsObject(), "Property metadata must be an object")
+                        prop.Metadata = p.Value("metadata")
+                    End If
+                    prop.EditorId = Text(p, "editorId")
+                    If prop.EditorId <> "" Then
+                        Require(Qualified(prop.EditorId) And String.Left(prop.EditorId, String.Len(name) + 1) = name + "." And Array.Count(prop.Options) > 0, "Invalid choice editor id")
+                        Require(Not Array.Contains(editorIds, String.LCase(prop.EditorId), True), "Duplicate editor symbol")
+                        Require(catalog.EditorViewFor(prop.EditorId) Is Nil And catalog.EditorFor(prop.EditorId) Is Nil, "Editor already registered")
+                        Array.Append(editorIds, String.LCase(prop.EditorId))
+                    End If
+                    control.AddProperty(prop)
+                Next
+                ValidateRecipe(item.Value("renderer"), control)
+                Array.Append(icons, StageIcon(item, control, resourceRoot))
+                Array.Append(staged, control)
+                Array.Append(recipes, item.Value("renderer"))
+            Next
+            ' All controls, expressions, recipes and collisions validated before commit.
+            For i As Integer = 0 To Array.Count(staged) - 1
+                Dim control As LayoutControlDescriptor = staged(i)
+                catalog.Register(control)
+                catalog.RegisterRenderer(control.TypeName, New LayoutRecipeRenderer(control, recipes(i)))
+                If icons(i) IsNot Nil Then catalog.RegisterIcon(control.TypeName, icons(i))
+                For Each prop As LayoutPropertyDescriptor In control.Properties
+                    If prop.EditorId <> "" Then catalog.RegisterEditorView(New LayoutChoiceFactory(prop.EditorId, prop.Options))
+                Next
+            Next
+            report.Value("loadedControls") = Array.Count(staged) * 1.0
+            report.Value("loadedPackages") = 1.0
+        Catch e As Exception
+            Diagnostic(report, e.Message)
+        End Try
+        Return report
+    End Function
+
+    Public Function LoadIndex(location As String, catalog As LayoutCatalog) As JSONItem
+        Dim report As JSONItem = NewReport()
+        Try
+            Dim index As JSONItem = ParseBounded(ReadBoundedText(location, 8388608, "Discovery index"), 8388608)
+            Require(Text(index, "schema") = "buoy.designer.index" And Number(index, "schemaVersion") = 1.0, "Unsupported index schema/version")
+            Dim packages As JSONItem = index.Value("packages")
+            Require(packages.IsArray() And packages.Count() <= 4096, "Invalid index packages")
+            Dim errors As JSONItem = index.Value("errors")
+            For i As Integer = 0 To errors.Count() - 1
+                report.Value("errors").Add(errors.ValueAt(i))
+            Next
+            For i As Integer = 0 To packages.Count() - 1
+                Dim entry As JSONItem = packages.ValueAt(i)
+                Dim imported As JSONItem = Me.ImportDescriptor(entry.Value("descriptor"), catalog)
+                Dim diagnostics As JSONItem = imported.Value("errors")
+                For j As Integer = 0 To diagnostics.Count() - 1
+                    diagnostics.ValueAt(j).Value("path") = Text(entry, "origin", location)
+                Next
+                MergeReport(report, imported)
+            Next
+        Catch e As Exception
+            Diagnostic(report, e.Message, location)
+        End Try
+        Return report
+    End Function
+
+    ''' Scans a refreshed project index or an unpacked package resource directory.
+    ''' Archive/global scanning happens in the startup helper, never by executing code.
+    Public Function DiscoverDirectory(location As String, catalog As LayoutCatalog) As JSONItem
+        Dim indexPath As String = Path.Join(location, ".buoy/designer/index-v1.json")
+        Dim index As New FileSystemItem(indexPath)
+        If index.Exists() Then Return Me.LoadIndex(indexPath, catalog)
+        Dim report As JSONItem = NewReport()
+        Dim resource As New FileSystemItem(Path.Join(location, "resources/buoy-designer/plugin.json"))
+        If resource.Exists() Then
+            Try
+                Dim content As String = ReadBoundedText(resource.FullPath(), 1048576, "Descriptor")
+                Return Me.ImportFrom(ParseBounded(content, 1048576), catalog, Path.Join(location, "resources/buoy-designer"))
+            Catch e As Exception
+                Diagnostic(report, e.Message, resource.FullPath())
+            End Try
+        Else
+            Diagnostic(report, "Discovery index missing; run tools/discover_layout_packages.py --project PROJECT", location)
+        End If
+        Return report
+    End Function
+End Class

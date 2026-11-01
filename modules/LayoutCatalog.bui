@@ -1,0 +1,907 @@
+' Compiled, explicit extension registration only. Opening a document never loads code.
+Public Interface LayoutRenderer
+    Function RendererId() As String
+    Sub Paint(g As IGraphics, x As Double, y As Double, width As Double, height As Double, values As JSONItem, selected As Boolean)
+End Interface
+
+' Editors return a proposed expression; None means cancellation. The host validates
+' its type and commits against the current document revision.
+Public Interface LayoutPropertyEditor
+    Function EditorId() As String
+    Function EditExpression(currentExpression As String) As Optional Of String
+End Interface
+
+' A host binds a document revision, node and property; False rejects a stale or
+' invalid proposal. Native editor views must commit only through this capability.
+Public Interface LayoutPropertyEditorHost
+    Function CommitExpression(expression As String) As Boolean
+End Interface
+
+''' Optional read-only sibling expressions from the same bound source snapshot.
+''' None means absent; expressions are data and must never be evaluated by editors.
+Public Interface LayoutPropertyEditorContextV1
+    Function SiblingExpression(propertyName As String) As Optional Of String
+    Function IsCurrent() As Boolean
+End Interface
+
+Public Interface LayoutPropertyViewFactory
+    Function EditorId() As String
+    Function CreateView(currentExpression As String, host As LayoutPropertyEditorHost) As View
+End Interface
+
+''' Optional lifecycle contract for a native editor View. Build children once;
+''' rebind displayed values and callbacks to the new host without retaining the old
+''' host. Old snapshot hosts remain expired. Rebind must not append native children.
+Public Interface LayoutReusablePropertyViewV1
+    Sub RebindProperty(currentExpression As String, host As LayoutPropertyEditorHost)
+End Interface
+
+Private Function IsDigit(ch As String) As Boolean
+    Return ch >= "0" And ch <= "9"
+End Function
+
+Private Function IsStringLiteral(text As String) As Boolean
+    Dim length As Integer = String.Len(text)
+    If length < 2 Then Return False
+    If String.Left(text, 1) <> "\"" Or String.Right(text, 1) <> "\"" Then Return False
+    Dim i As Integer = 2
+    While i < length
+        Dim ch As String = String.Mid(text, i, 1)
+        If ch = "\"" Or String.Asc(ch) < 32 Then Return False
+        If ch = "\\" Then
+            i += 1
+            If i >= length Then Return False
+            ch = String.Mid(text, i, 1)
+            If Not Array.Contains(["n", "r", "t", "\"", "\\"], ch, True) Then Return False
+        End If
+        i += 1
+    End While
+    Return True
+End Function
+
+Private Function IsQualifiedEnumSymbol(text As String) As Boolean
+    Dim segments As Array Of String = String.Split(text, ".")
+    If Array.Count(segments) < 2 Then Return False
+    For Each segment As String In segments
+        If String.Len(segment) = 0 Then Return False
+        Dim first As Boolean = True
+        For Each ch As String In String.Chars(segment)
+            Dim code As Integer = String.Asc(ch)
+            Dim letter As Boolean = (code >= 65 And code <= 90) Or (code >= 97 And code <= 122) Or ch = "_"
+            If Not letter Then
+                If first Or Not IsDigit(ch) Then Return False
+            End If
+            first = False
+        Next
+    Next
+    Return True
+End Function
+
+Private Function IsIntegerLiteral(text As String) As Boolean
+    Dim digits As String = text
+    Dim negative As Boolean = String.Left(digits, 1) = "-"
+    If negative Then digits = String.Substring(digits, 1)
+    If String.Len(digits) = 0 Then Return False
+    For Each ch As String In String.Chars(digits)
+        If Not IsDigit(ch) Then Return False
+    Next
+    While String.Len(digits) > 1 And String.Left(digits, 1) = "0"
+        digits = String.Substring(digits, 1)
+    End While
+    Dim limit As String = "9223372036854775807"
+    If negative Then limit = "9223372036854775808"
+    If String.Len(digits) > 19 Then Return False
+    If String.Len(digits) = 19 Then Return String.Compare(digits, limit, True) <= 0
+    Return True
+End Function
+
+' Deliberately accepts a subset of Buoy numeric syntax: decimal digits, an
+' optional fractional part and exponent. No calls, operators, hex or suffixes.
+Private Function IsDoubleLiteral(text As String) As Boolean
+    Dim length As Integer = String.Len(text)
+    Dim i As Integer = 1
+    If String.Left(text, 1) = "-" Then i += 1
+    Dim start As Integer = i
+    While i <= length
+        If Not IsDigit(String.Mid(text, i, 1)) Then Exit While
+        i += 1
+    End While
+    If i = start Then Return False
+    If i <= length And String.Mid(text, i, 1) = "." Then
+        i += 1
+        start = i
+        While i <= length
+            If Not IsDigit(String.Mid(text, i, 1)) Then Exit While
+            i += 1
+        End While
+        If i = start Then Return False
+    End If
+    If i <= length And String.Mid(text, i, 1) = "e" Then
+        i += 1
+        If i <= length Then
+            If String.Mid(text, i, 1) = "+" Or String.Mid(text, i, 1) = "-" Then i += 1
+        End If
+        start = i
+        While i <= length
+            If Not IsDigit(String.Mid(text, i, 1)) Then Exit While
+            i += 1
+        End While
+        If i = start Then Return False
+    End If
+    If i <= length Then Return False
+    If Not String.Contains(text, ".") And Not String.Contains(text, "e") Then
+        If Not IsIntegerLiteral(text) Then Return False
+    End If
+    Dim parsed As Result Of Double, String = Double.Parse(text)
+    If Not parsed.IsOk Then Return False
+    Dim number As Double = parsed.Value
+    Return number = number And number <> Double.Infinity And number <> -Double.Infinity
+End Function
+
+''' Unknown kinds and expression defaults are retained verbatim for inspection.
+''' ValidateExpression is a mutation gate, never an evaluator or source parser.
+Public Class LayoutPropertyDescriptor
+    Public ReadOnly Property Name As String
+    Public ReadOnly Property Kind As String
+    Public ReadOnly Property DefaultExpression As String
+    Public Property DisplayName As String
+    Public Property Category As String = "Properties"
+    Public Property EditorId As String = ""
+    Public Property ReadOnly As Boolean = False
+    ' Enum options are complete Buoy expressions, e.g. Checkbox.CheckState.True.
+    Public Property Options As Array Of String = []
+    ' Empty/-1 means a property assignment; otherwise a constructor argument.
+    Public Property ConstructorParameter As String = ""
+    Public Property ConstructorIndex As Integer = -1
+    Public Property Minimum As Optional Of Double = None
+    Public Property Maximum As Optional Of Double = None
+    Public Property StepValue As Double = 1.0
+    ' Opaque metadata for compiled editors, never executable source or attributes.
+    Public Property Metadata As JSONItem
+
+    Public Sub Constructor(name As String, kind As String, defaultExpression As String = "")
+        If String.Trim(name) = "" Then Throw New InvalidArgumentException("Property name is required")
+        Me.Name = name
+        Me.Kind = kind
+        Me.DefaultExpression = defaultExpression
+        Me.DisplayName = name
+        Me.Metadata = New JSONItem()
+    End Sub
+
+    Public Function ValidateExpression(expression As String) As Boolean
+        If Me.ReadOnly Then Return False
+        Dim text As String = String.Trim(expression)
+        Dim kindName As String = String.LCase(Me.Kind)
+        Select Case kindName
+            Case "string"
+                Return IsStringLiteral(text)
+            Case "boolean"
+                Return text = "True" Or text = "False"
+            Case "enum"
+                ' The package explicitly enumerates trusted symbolic values.
+                Return IsQualifiedEnumSymbol(text) And Array.Contains(Me.Options, text)
+            Case "integer", "double"
+                If kindName = "integer" Then
+                    If Not IsIntegerLiteral(text) Then Return False
+                Else
+                    If Not IsDoubleLiteral(text) Then Return False
+                End If
+                Dim number As Double = Double.Parse(text).Or(0.0)
+                If Me.Minimum.HasValue Then
+                    If Not (number >= Me.Minimum.Value) Then Return False
+                End If
+                If Me.Maximum.HasValue Then
+                    If Not (number <= Me.Maximum.Value) Then Return False
+                End If
+                Return True
+            Case Else
+                ' Includes expression: preserving source is distinct from editing it.
+                Return False
+        End Select
+    End Function
+End Class
+
+Public Class LayoutControlDescriptor
+    Public ReadOnly Property TypeName As String
+    Public ReadOnly Property DisplayName As String
+    Public ReadOnly Property PackageName As String
+    Public Property DefaultWidth As Integer = 100
+    Public Property DefaultHeight As Integer = 30
+    Public Property Metadata As JSONItem
+    ''' One-line palette/tooltip description; empty when the provider gave none.
+    Public Property Description As String = ""
+    Private Property mProperties As Array Of LayoutPropertyDescriptor = []
+    Private Property mCategory As String = ""
+
+    ''' Palette grouping ("Buttons", "Text", "Input", "Containers", "Indicators",
+    ''' "Data", "Media" for builtins). Unset package controls group under their
+    ''' package name; unset builtin-package controls under "Controls".
+    Public Property Category As String
+        Get
+            If Me.mCategory <> "" Then Return Me.mCategory
+            If Me.PackageName = "builtin" Then Return "Controls"
+            Return Me.PackageName
+        End Get
+        Set
+            Me.mCategory = String.Trim(value)
+        End Set
+    End Property
+
+    Public Sub Constructor(typeName As String, displayName As String, packageName As String = "builtin")
+        If String.Trim(typeName) = "" Then Throw New InvalidArgumentException("Control type is required")
+        If String.Trim(packageName) = "" Then Throw New InvalidArgumentException("Package name is required")
+        Me.TypeName = typeName
+        Me.DisplayName = displayName
+        Me.PackageName = packageName
+        Me.Metadata = New JSONItem()
+    End Sub
+
+    Public Property Properties As Array Of LayoutPropertyDescriptor
+        Get
+            Return Array.Clone(Me.mProperties)
+        End Get
+    End Property
+
+    Public Sub AddProperty(descriptor As LayoutPropertyDescriptor)
+        If descriptor Is Nil Then Throw New InvalidArgumentException("Property descriptor is required")
+        For Each existing As LayoutPropertyDescriptor In Me.mProperties
+            If existing.Name = descriptor.Name Then Throw New InvalidArgumentException("Duplicate property: " + descriptor.Name)
+        Next
+        Array.Append(Me.mProperties, descriptor)
+    End Sub
+End Class
+
+''' Draws a square palette icon at (x, y) with side size points. dark selects the
+''' dark-appearance palette. Painters must not retain g and must be side-effect free.
+Public Interface LayoutIconPainter
+    Sub PaintIcon(g As IGraphics, x As Double, y As Double, size As Double, dark As Boolean)
+End Interface
+
+' Glyph drawing helpers. Geometry is on the 24-unit Buoy glyph grid
+' (design/iconset); LayoutGlyphIcon scales the grid to the requested size.
+Private Sub GlyphFrame(g As IGraphics, x As Double, y As Double, w As Double, h As Double, radius As Double, lw As Double, c As Color)
+    If radius > 0.0 Then
+        g.StrokeRoundedRect(x, y, w, h, radius, lw, c)
+    Else
+        g.StrokeRect(x, y, w, h, lw, c)
+    End If
+End Sub
+
+Private Sub GlyphFill(g As IGraphics, x As Double, y As Double, w As Double, h As Double, radius As Double, c As Color)
+    If radius > 0.0 Then
+        g.FillRoundedRect(x, y, w, h, radius, c)
+    Else
+        g.FillRect(x, y, w, h, c)
+    End If
+End Sub
+
+Private Sub GlyphLine(g As IGraphics, x1 As Double, y1 As Double, x2 As Double, y2 As Double, lw As Double, c As Color)
+    g.DrawLine(x1, y1, x2, y2, lw, c)
+End Sub
+
+' Open (or closed) polyline through flattened x,y pairs.
+Private Sub GlyphPolyline(g As IGraphics, points As Array Of Double, lw As Double, c As Color, closed As Boolean = False)
+    If Array.Count(points) < 4 Then Return
+    g.BeginPath()
+    g.MoveTo(points(0), points(1))
+    Dim i As Integer = 2
+    While i + 1 < Array.Count(points)
+        g.LineTo(points(i), points(i + 1))
+        i += 2
+    End While
+    If closed Then g.ClosePath()
+    g.StrokePath(lw, c)
+End Sub
+
+Private Sub GlyphPolygonFill(g As IGraphics, points As Array Of Double, c As Color)
+    If Array.Count(points) < 6 Then Return
+    g.BeginPath()
+    g.MoveTo(points(0), points(1))
+    Dim i As Integer = 2
+    While i + 1 < Array.Count(points)
+        g.LineTo(points(i), points(i + 1))
+        i += 2
+    End While
+    g.ClosePath()
+    g.FillPath(c)
+End Sub
+
+' BeginPath first: on Cairo an oval otherwise joins the current point left by a
+' preceding DrawString/LineTo with a stray segment.
+Private Sub GlyphCircle(g As IGraphics, cx As Double, cy As Double, r As Double, lw As Double, c As Color)
+    g.BeginPath()
+    g.StrokeOval(cx - r, cy - r, 2.0 * r, 2.0 * r, lw, c)
+End Sub
+
+Private Sub GlyphDot(g As IGraphics, cx As Double, cy As Double, r As Double, c As Color)
+    g.BeginPath()
+    g.FillOval(cx - r, cy - r, 2.0 * r, 2.0 * r, c)
+End Sub
+
+' Quarter-circle corner from the current point (ax, ay) to (bx, by) whose
+' control handles leave/arrive along the given axis-aligned tangents.
+Private Sub GlyphCorner(g As IGraphics, ax As Double, ay As Double, bx As Double, by As Double, horizontalFirst As Boolean)
+    Dim k As Double = 0.5523
+    If horizontalFirst Then
+        g.CurveTo(ax + (bx - ax) * k, ay, bx, by - (by - ay) * k, bx, by)
+    Else
+        g.CurveTo(ax, ay + (by - ay) * k, bx - (bx - ax) * k, by, bx, by)
+    End If
+End Sub
+
+Private Function GlyphAlpha(c As Color, alpha As Double) As Color
+    Return Color.RGBA(c.R, c.G, c.B, alpha)
+End Function
+
+''' The builtin Buoy control glyph set drawn with IGraphics vectors: a 24-unit grid,
+''' 1.75-unit strokes in the ink colour and one accent detail per glyph. Unknown
+''' glyph names draw the generic control glyph.
+Public Class LayoutGlyphIcon Implements LayoutIconPainter
+    Public ReadOnly Property Glyph As String
+
+    Public Sub Constructor(glyph As String)
+        Dim key As String = LayoutGlyphIcon.Normalize(glyph)
+        If Not LayoutGlyphIcon.Knows(key) Then key = "generic"
+        Me.Glyph = key
+    End Sub
+
+    ''' Lower-case, separator-free key: "Text field", "text-field" and "TextField"
+    ''' all resolve to "textfield".
+    Public Shared Function Normalize(name As String) As String
+        Dim key As String = String.LCase(String.Trim(name))
+        If String.StartsWith(key, "control.") Then key = String.Substring(key, 8)
+        key = String.Replace(key, "-", "")
+        key = String.Replace(key, " ", "")
+        key = String.Replace(key, "_", "")
+        Return key
+    End Function
+
+    Public Shared Function Knows(name As String) As Boolean
+        Dim known As Array Of String = ["button", "label", "textfield", "textarea", "checkbox", "radiobutton", "radiogroup", "combobox", "popupmenu", "listbox", "slider", "progressbar", "stepper", "tabview", "pagepanel", "groupbox", "view", "imageview", "canvas", "datetimepicker", "disclosuretriangle", "splitter", "htmlview", "window", "stackview", "scrollview", "treeview", "toolbar", "menubar", "separator", "searchfield", "segmentedbutton", "bevelbutton", "statusbadge", "colorpicker", "activityindicator", "package", "generic"]
+        Return Array.Contains(known, LayoutGlyphIcon.Normalize(name), True)
+    End Function
+
+    Public Sub PaintIcon(g As IGraphics, x As Double, y As Double, size As Double, dark As Boolean)
+        If g Is Nil Or Not (size > 0.0) Then Return
+        Dim ink As Color = Color.RGB(0.20, 0.235, 0.275)
+        Dim accent As Color = Color.RGB(0.059, 0.463, 0.431)
+        If dark Then
+            ink = Color.RGB(0.86, 0.88, 0.91)
+            accent = Color.RGB(0.373, 0.816, 0.725)
+        End If
+        Dim soft As Color = GlyphAlpha(ink, 0.45)
+        Dim wash As Color = GlyphAlpha(accent, 0.30)
+        ' 1.75 grid units; never thinner than 1.25 device points so 16pt icons stay crisp.
+        Dim lw As Double = Math.Max(1.75, 1.25 * 24.0 / size)
+        g.Save()
+        Try
+            g.Translate(x, y)
+            g.Scale(size / 24.0, size / 24.0)
+            g.BeginPath()
+            Select Case Me.Glyph
+                Case "button"
+                    GlyphFrame(g, 2.75, 7.0, 18.5, 10.0, 3.5, lw, ink)
+                    GlyphLine(g, 8.5, 12.0, 15.5, 12.0, lw, accent)
+                Case "bevelbutton"
+                    GlyphFrame(g, 3.5, 3.5, 17.0, 17.0, 2.0, lw, ink)
+                    GlyphFrame(g, 7.5, 7.5, 9.0, 9.0, 1.0, lw, accent)
+                    GlyphLine(g, 4.25, 4.25, 7.5, 7.5, lw, soft)
+                    GlyphLine(g, 19.75, 19.75, 16.5, 16.5, lw, soft)
+                Case "segmentedbutton"
+                    GlyphFill(g, 3.6, 7.85, 5.4, 8.3, 2.4, wash)
+                    GlyphFrame(g, 2.75, 7.0, 18.5, 10.0, 3.0, lw, ink)
+                    GlyphLine(g, 9.0, 7.0, 9.0, 17.0, lw, ink)
+                    GlyphLine(g, 15.0, 7.0, 15.0, 17.0, lw, ink)
+                Case "label"
+                    GlyphLine(g, 5.0, 5.5, 19.0, 5.5, lw, ink)
+                    GlyphLine(g, 12.0, 5.5, 12.0, 18.5, lw, ink)
+                    GlyphLine(g, 9.0, 18.5, 15.0, 18.5, lw, accent)
+                Case "textfield"
+                    GlyphFrame(g, 2.75, 7.0, 18.5, 10.0, 2.0, lw, ink)
+                    GlyphLine(g, 7.0, 9.5, 7.0, 14.5, lw, accent)
+                    GlyphLine(g, 5.9, 9.5, 8.1, 9.5, lw, accent)
+                    GlyphLine(g, 5.9, 14.5, 8.1, 14.5, lw, accent)
+                    GlyphLine(g, 11.0, 12.0, 17.5, 12.0, lw, soft)
+                Case "searchfield"
+                    GlyphFrame(g, 2.75, 6.5, 18.5, 11.0, 5.5, lw, ink)
+                    GlyphCircle(g, 8.75, 11.5, 2.25, lw, accent)
+                    GlyphLine(g, 10.4, 13.15, 12.0, 14.75, lw, accent)
+                    GlyphLine(g, 14.5, 12.0, 17.5, 12.0, lw, soft)
+                Case "textarea"
+                    GlyphFrame(g, 3.0, 3.0, 18.0, 18.0, 2.5, lw, ink)
+                    GlyphLine(g, 7.0, 7.75, 17.0, 7.75, lw, soft)
+                    GlyphLine(g, 7.0, 11.25, 17.0, 11.25, lw, soft)
+                    GlyphLine(g, 7.0, 14.75, 13.0, 14.75, lw, soft)
+                    GlyphLine(g, 17.75, 15.75, 15.75, 17.75, lw, accent)
+                Case "checkbox"
+                    GlyphFrame(g, 3.5, 3.5, 17.0, 17.0, 3.5, lw, ink)
+                    GlyphPolyline(g, [7.75, 12.25, 10.65, 15.15, 16.25, 9.5], lw, accent)
+                Case "radiobutton"
+                    GlyphCircle(g, 12.0, 12.0, 8.5, lw, ink)
+                    GlyphDot(g, 12.0, 12.0, 3.5, accent)
+                Case "radiogroup"
+                    GlyphCircle(g, 6.5, 7.0, 3.0, lw, ink)
+                    GlyphDot(g, 6.5, 7.0, 1.25, accent)
+                    GlyphCircle(g, 6.5, 17.0, 3.0, lw, ink)
+                    GlyphLine(g, 12.5, 7.0, 20.5, 7.0, lw, ink)
+                    GlyphLine(g, 12.5, 17.0, 20.5, 17.0, lw, soft)
+                Case "combobox", "popupmenu"
+                    GlyphFrame(g, 2.75, 7.0, 18.5, 10.0, 2.0, lw, ink)
+                    GlyphLine(g, 6.0, 12.0, 11.5, 12.0, lw, soft)
+                    GlyphPolyline(g, [14.5, 10.75, 16.75, 13.0, 19.0, 10.75], lw, accent)
+                Case "listbox"
+                    GlyphFill(g, 3.9, 9.9, 16.2, 3.7, 0.0, wash)
+                    GlyphFrame(g, 3.0, 3.5, 18.0, 17.0, 2.5, lw, ink)
+                    GlyphLine(g, 3.0, 9.0, 21.0, 9.0, lw, ink)
+                    GlyphLine(g, 3.0, 14.5, 21.0, 14.5, lw, ink)
+                    GlyphLine(g, 9.0, 3.5, 9.0, 20.5, lw, soft)
+                Case "treeview"
+                    GlyphFrame(g, 3.0, 3.0, 6.0, 4.5, 1.0, lw, accent)
+                    GlyphFrame(g, 12.0, 9.0, 9.0, 4.5, 1.0, lw, ink)
+                    GlyphFrame(g, 12.0, 16.0, 9.0, 4.5, 1.0, lw, ink)
+                    GlyphPolyline(g, [6.0, 7.5, 6.0, 18.25, 12.0, 18.25], lw, soft)
+                    GlyphLine(g, 6.0, 11.25, 12.0, 11.25, lw, soft)
+                Case "slider"
+                    GlyphLine(g, 3.0, 12.0, 6.25, 12.0, lw, accent)
+                    GlyphLine(g, 11.75, 12.0, 21.0, 12.0, lw, ink)
+                    GlyphCircle(g, 9.0, 12.0, 2.75, lw, ink)
+                Case "progressbar"
+                    GlyphFrame(g, 2.75, 8.5, 18.5, 7.0, 3.5, lw, ink)
+                    GlyphFill(g, 5.0, 10.75, 9.0, 2.5, 1.25, accent)
+                Case "activityindicator"
+                    GlyphLine(g, 12.0, 7.75, 12.0, 3.75, lw, accent)
+                    GlyphLine(g, 15.01, 8.99, 17.83, 6.17, lw, GlyphAlpha(ink, 0.88))
+                    GlyphLine(g, 16.25, 12.0, 20.25, 12.0, lw, GlyphAlpha(ink, 0.76))
+                    GlyphLine(g, 15.01, 15.01, 17.83, 17.83, lw, GlyphAlpha(ink, 0.64))
+                    GlyphLine(g, 12.0, 16.25, 12.0, 20.25, lw, GlyphAlpha(ink, 0.52))
+                    GlyphLine(g, 8.99, 15.01, 6.17, 17.83, lw, GlyphAlpha(ink, 0.40))
+                    GlyphLine(g, 7.75, 12.0, 3.75, 12.0, lw, GlyphAlpha(ink, 0.30))
+                    GlyphLine(g, 8.99, 8.99, 6.17, 6.17, lw, GlyphAlpha(ink, 0.22))
+                Case "stepper"
+                    GlyphFrame(g, 7.0, 2.75, 10.0, 18.5, 3.0, lw, ink)
+                    GlyphLine(g, 7.0, 12.0, 17.0, 12.0, lw, ink)
+                    GlyphPolyline(g, [9.5, 8.5, 12.0, 6.0, 14.5, 8.5], lw, accent)
+                    GlyphPolyline(g, [9.5, 15.5, 12.0, 18.0, 14.5, 15.5], lw, accent)
+                Case "tabview"
+                    GlyphFill(g, 7.85, 5.1, 4.15, 3.8, 1.0, wash)
+                    g.BeginPath()
+                    g.MoveTo(7.0, 7.0)
+                    g.LineTo(5.5, 7.0)
+                    GlyphCorner(g, 5.5, 7.0, 3.0, 9.5, True)
+                    g.LineTo(3.0, 18.5)
+                    GlyphCorner(g, 3.0, 18.5, 5.5, 21.0, False)
+                    g.LineTo(18.5, 21.0)
+                    GlyphCorner(g, 18.5, 21.0, 21.0, 18.5, True)
+                    g.LineTo(21.0, 9.5)
+                    GlyphCorner(g, 21.0, 9.5, 18.5, 7.0, False)
+                    g.LineTo(17.0, 7.0)
+                    g.StrokePath(lw, ink)
+                    GlyphFrame(g, 7.0, 4.25, 10.0, 5.5, 1.5, lw, accent)
+                    GlyphLine(g, 12.0, 4.25, 12.0, 9.75, lw, accent)
+                Case "pagepanel"
+                    g.BeginPath()
+                    g.MoveTo(7.0, 7.0)
+                    g.LineTo(7.0, 5.5)
+                    GlyphCorner(g, 7.0, 5.5, 9.5, 3.0, False)
+                    g.LineTo(18.5, 3.0)
+                    GlyphCorner(g, 18.5, 3.0, 21.0, 5.5, True)
+                    g.LineTo(21.0, 14.5)
+                    GlyphCorner(g, 21.0, 14.5, 18.5, 17.0, False)
+                    g.LineTo(17.0, 17.0)
+                    g.StrokePath(lw, soft)
+                    GlyphFrame(g, 3.0, 7.0, 14.0, 14.0, 2.5, lw, ink)
+                    GlyphDot(g, 7.25, 17.25, 1.05, accent)
+                    GlyphDot(g, 10.0, 17.25, 0.95, ink)
+                    GlyphDot(g, 12.75, 17.25, 0.95, ink)
+                Case "groupbox"
+                    GlyphLine(g, 3.5, 4.5, 11.5, 4.5, lw, accent)
+                    GlyphFrame(g, 3.0, 8.0, 18.0, 13.0, 2.5, lw, ink)
+                    GlyphLine(g, 6.5, 12.5, 17.5, 12.5, lw, soft)
+                    GlyphLine(g, 6.5, 16.5, 13.5, 16.5, lw, soft)
+                Case "view"
+                    GlyphFrame(g, 3.0, 3.0, 18.0, 18.0, 2.5, lw, ink)
+                    GlyphFrame(g, 6.5, 6.5, 6.0, 5.0, 1.0, lw, accent)
+                    GlyphLine(g, 6.5, 15.5, 17.5, 15.5, lw, soft)
+                Case "stackview"
+                    GlyphFrame(g, 4.0, 3.5, 16.0, 3.75, 1.25, lw, ink)
+                    GlyphFrame(g, 4.0, 10.125, 16.0, 3.75, 1.25, lw, accent)
+                    GlyphFrame(g, 4.0, 16.75, 16.0, 3.75, 1.25, lw, ink)
+                Case "scrollview"
+                    GlyphFrame(g, 3.0, 3.0, 18.0, 18.0, 2.5, lw, ink)
+                    GlyphLine(g, 6.75, 8.0, 13.25, 8.0, lw, soft)
+                    GlyphLine(g, 6.75, 12.0, 13.25, 12.0, lw, soft)
+                    GlyphLine(g, 6.75, 16.0, 10.75, 16.0, lw, soft)
+                    GlyphFill(g, 16.0, 6.5, 2.0, 6.5, 1.0, accent)
+                Case "splitter"
+                    GlyphFrame(g, 2.75, 4.0, 18.5, 16.0, 2.5, lw, ink)
+                    GlyphLine(g, 12.0, 4.0, 12.0, 20.0, lw, ink)
+                    GlyphPolyline(g, [8.0, 10.0, 6.0, 12.0, 8.0, 14.0], lw, accent)
+                    GlyphPolyline(g, [16.0, 10.0, 18.0, 12.0, 16.0, 14.0], lw, accent)
+                Case "imageview"
+                    GlyphFrame(g, 3.0, 4.0, 18.0, 16.0, 2.5, lw, ink)
+                    GlyphCircle(g, 8.5, 9.5, 1.75, lw, accent)
+                    GlyphPolyline(g, [21.0, 16.0, 16.5, 11.5, 7.0, 20.0], lw, ink)
+                Case "canvas"
+                    GlyphFrame(g, 3.0, 3.0, 18.0, 18.0, 2.5, lw, ink)
+                    g.BeginPath()
+                    g.MoveTo(7.0, 16.5)
+                    g.CurveTo(8.5, 12.5, 10.0, 11.0, 11.25, 13.0)
+                    g.CurveTo(12.5, 15.0, 14.0, 13.5, 17.0, 8.0)
+                    g.StrokePath(lw, accent)
+                Case "datetimepicker"
+                    GlyphFrame(g, 3.0, 4.5, 18.0, 16.5, 2.5, lw, ink)
+                    GlyphLine(g, 3.0, 9.25, 21.0, 9.25, lw, ink)
+                    GlyphLine(g, 8.0, 2.75, 8.0, 6.25, lw, ink)
+                    GlyphLine(g, 16.0, 2.75, 16.0, 6.25, lw, ink)
+                    GlyphDot(g, 7.5, 13.25, 0.95, ink)
+                    GlyphDot(g, 12.0, 13.25, 0.95, ink)
+                    GlyphDot(g, 16.5, 13.25, 1.15, accent)
+                    GlyphDot(g, 7.5, 17.0, 0.95, ink)
+                    GlyphDot(g, 12.0, 17.0, 0.95, ink)
+                Case "disclosuretriangle"
+                    GlyphPolygonFill(g, [7.0, 9.25, 17.0, 9.25, 12.0, 15.25], accent)
+                    GlyphPolyline(g, [7.0, 9.25, 17.0, 9.25, 12.0, 15.25], lw, accent, True)
+                Case "htmlview"
+                    GlyphFrame(g, 2.75, 4.0, 18.5, 16.0, 2.5, lw, ink)
+                    GlyphLine(g, 2.75, 8.75, 21.25, 8.75, lw, ink)
+                    GlyphPolyline(g, [9.5, 11.75, 7.25, 14.25, 9.5, 16.75], lw, accent)
+                    GlyphPolyline(g, [14.5, 11.75, 16.75, 14.25, 14.5, 16.75], lw, accent)
+                Case "window"
+                    GlyphFrame(g, 2.75, 4.0, 18.5, 16.0, 2.5, lw, ink)
+                    GlyphLine(g, 2.75, 8.75, 21.25, 8.75, lw, ink)
+                    GlyphDot(g, 6.0, 6.4, 0.95, accent)
+                    GlyphDot(g, 8.75, 6.4, 0.95, accent)
+                Case "toolbar"
+                    GlyphFrame(g, 2.75, 6.5, 18.5, 11.0, 2.5, lw, ink)
+                    GlyphFill(g, 5.75, 10.25, 3.5, 3.5, 0.9, accent)
+                    GlyphFill(g, 10.25, 10.25, 3.5, 3.5, 0.9, ink)
+                    GlyphFill(g, 14.75, 10.25, 3.5, 3.5, 0.9, ink)
+                Case "menubar"
+                    GlyphFrame(g, 2.75, 3.5, 18.5, 5.0, 1.5, lw, ink)
+                    GlyphFrame(g, 5.0, 8.5, 9.5, 11.5, 1.5, lw, ink)
+                    GlyphLine(g, 7.75, 12.25, 11.75, 12.25, lw, accent)
+                    GlyphLine(g, 7.75, 16.0, 11.75, 16.0, lw, soft)
+                Case "separator"
+                    GlyphLine(g, 3.0, 12.0, 21.0, 12.0, lw, accent)
+                    GlyphLine(g, 6.5, 7.5, 17.5, 7.5, lw, GlyphAlpha(ink, 0.35))
+                    GlyphLine(g, 6.5, 16.5, 17.5, 16.5, lw, GlyphAlpha(ink, 0.35))
+                Case "statusbadge"
+                    GlyphFrame(g, 2.75, 7.5, 18.5, 9.0, 4.5, lw, ink)
+                    GlyphDot(g, 7.5, 12.0, 1.6, accent)
+                    GlyphLine(g, 11.0, 12.0, 17.5, 12.0, lw, ink)
+                Case "colorpicker"
+                    GlyphPolygonFill(g, [12.0, 12.0, 12.0, 3.25, 16.4, 4.45, 19.0, 7.0, 20.35, 10.0, 20.6, 13.2, 19.6, 16.4], wash)
+                    GlyphCircle(g, 12.0, 12.0, 8.75, lw, ink)
+                    GlyphLine(g, 12.0, 3.25, 12.0, 12.0, lw, ink)
+                    GlyphLine(g, 12.0, 12.0, 19.6, 16.4, lw, ink)
+                    GlyphLine(g, 12.0, 12.0, 4.4, 16.4, lw, ink)
+                Case "package"
+                    GlyphPolyline(g, [12.0, 2.75, 20.25, 7.25, 20.25, 16.75, 12.0, 21.25, 3.75, 16.75, 3.75, 7.25], lw, ink, True)
+                    GlyphPolyline(g, [3.75, 7.25, 12.0, 11.75, 20.25, 7.25], lw, accent)
+                    GlyphLine(g, 12.0, 11.75, 12.0, 21.25, lw, accent)
+                Case Else
+                    GlyphFrame(g, 5.0, 5.0, 14.0, 14.0, 1.5, lw, ink)
+                    GlyphFill(g, 3.5, 3.5, 3.0, 3.0, 0.6, accent)
+                    GlyphFill(g, 17.5, 3.5, 3.0, 3.0, 0.6, accent)
+                    GlyphFill(g, 3.5, 17.5, 3.0, 3.0, 0.6, accent)
+                    GlyphFill(g, 17.5, 17.5, 3.0, 3.0, 0.6, accent)
+            End Select
+        Finally
+            g.Restore()
+        End Try
+    End Sub
+End Class
+
+Public Class LayoutCatalog
+    Private Property mControls As Array Of LayoutControlDescriptor = []
+    Private Property mRendererTypes As Array Of String = []
+    Private Property mRenderers As Array Of LayoutRenderer = []
+    Private Property mEditorIds As Array Of String = []
+    Private Property mEditors As Array Of LayoutPropertyEditor = []
+    Private Property mViewIds As Array Of String = []
+    Private Property mViews As Array Of LayoutPropertyViewFactory = []
+    Private Property mIconTypes As Array Of String = []
+    Private Property mIcons As Array Of LayoutIconPainter = []
+
+    Public Sub Constructor()
+    End Sub
+
+    ''' Palette group order: builtin groups first, then any other categories in
+    ''' first-registration order (package names and custom groups).
+    Public Function Categories() As Array Of String
+        Dim ordered As Array Of String = []
+        For Each name As String In ["Buttons", "Text", "Input", "Containers", "Indicators", "Data", "Media", "Controls"]
+            For Each descriptor As LayoutControlDescriptor In Me.mControls
+                If String.Compare(descriptor.Category, name, True) = 0 Then
+                    Array.Append(ordered, name)
+                    Exit For
+                End If
+            Next
+        Next
+        For Each descriptor As LayoutControlDescriptor In Me.mControls
+            Dim seen As Boolean = False
+            For Each existing As String In ordered
+                If String.Compare(existing, descriptor.Category, True) = 0 Then seen = True
+            Next
+            If Not seen Then Array.Append(ordered, descriptor.Category)
+        Next
+        Return ordered
+    End Function
+
+    ''' Compiled extensions and discovered data icons register painters here; a later
+    ''' registration for the same type replaces the earlier one (hosts may re-theme).
+    ''' Types need not be registered controls, so hosts can also supply icons for
+    ''' layout roots such as Window.
+    ''' The identity is resolved when this is called: an exact type name (or a
+    ''' unique qualified source name, as Find) first; otherwise a bare source name
+    ''' such as "Thing" for "pkg.Thing" maps to the one registered control whose
+    ''' type name or sourceTypeName matches it (case-insensitively, like icon
+    ''' keys). If none or several match, the icon is stored under the name as
+    ''' given, so IconFor finds it only by that exact (case-insensitive) name;
+    ''' register controls before their icons, and use the qualified type name
+    ''' when two packages share a source name. "Window" (the layout root, never a
+    ''' control) is never resolved this way, so a package control whose source
+    ''' name is Window cannot capture a host's root icon. Other unregistered core
+    ''' names (Splitter, TreeView...) do resolve to a unique package control that
+    ''' claims them; register those core icons before loading packages.
+    Public Sub RegisterIcon(typeName As String, painter As LayoutIconPainter)
+        If painter Is Nil Then Throw New InvalidArgumentException("Icon painter is required")
+        If String.Trim(typeName) = "" Then Throw New InvalidArgumentException("Icon type is required")
+        Dim key As String = typeName
+        Dim descriptor As LayoutControlDescriptor = Me.Find(typeName)
+        If descriptor Is Nil And Not String.Contains(typeName, ".") And String.LCase(String.Trim(typeName)) <> "window" Then descriptor = Me.UniqueIconSource(typeName)
+        If descriptor IsNot Nil Then key = descriptor.TypeName
+        key = String.LCase(key)
+        Dim index As Integer = Array.IndexOf(Me.mIconTypes, key)
+        If index >= 0 Then
+            Me.mIcons(index) = painter
+            Return
+        End If
+        Array.Append(Me.mIconTypes, key)
+        Array.Append(Me.mIcons, painter)
+    End Sub
+
+    ' The single control whose type name or sourceTypeName equals a bare name
+    ' (case-insensitive), or Nil when there is none or the name is ambiguous.
+    ' Case-insensitive like icon keys, unlike Find/FindSource (source symbols),
+    ' which stay case-sensitive.
+    Private Function UniqueIconSource(typeName As String) As LayoutControlDescriptor
+        Dim wanted As String = String.LCase(typeName)
+        Dim found As LayoutControlDescriptor
+        For Each descriptor As LayoutControlDescriptor In Me.mControls
+            Dim source As String = descriptor.Metadata.Value("sourceTypeName").AsString().Or("")
+            If String.LCase(descriptor.TypeName) <> wanted And String.LCase(source) <> wanted Then Continue For
+            If found IsNot Nil Then Return Nil
+            found = descriptor
+        Next
+        Return found
+    End Function
+
+    ''' Never Nil: a registered painter, else the builtin glyph for an unqualified
+    ''' builtin type (including roots such as Window and Splitter), else the package
+    ''' glyph for package controls, else the generic control glyph.
+    Public Function IconFor(typeName As String) As LayoutIconPainter
+        Dim key As String = typeName
+        Dim descriptor As LayoutControlDescriptor = Me.Find(typeName)
+        If descriptor IsNot Nil Then key = descriptor.TypeName
+        Dim index As Integer = Array.IndexOf(Me.mIconTypes, String.LCase(key))
+        If index >= 0 Then Return Me.mIcons(index)
+        Dim packaged As Boolean = String.Contains(key, ".")
+        If descriptor IsNot Nil Then
+            If descriptor.PackageName <> "builtin" Then packaged = True
+        End If
+        If packaged Then Return New LayoutGlyphIcon("package")
+        Return New LayoutGlyphIcon(key)
+    End Function
+
+    ''' True when IconFor returns a painter registered through RegisterIcon.
+    Public Function HasRegisteredIcon(typeName As String) As Boolean
+        Dim key As String = typeName
+        Dim descriptor As LayoutControlDescriptor = Me.Find(typeName)
+        If descriptor IsNot Nil Then key = descriptor.TypeName
+        Return Array.IndexOf(Me.mIconTypes, String.LCase(key)) >= 0
+    End Function
+
+    Public Sub Register(descriptor As LayoutControlDescriptor)
+        If descriptor Is Nil Then Throw New InvalidArgumentException("Control descriptor is required")
+        If Me.Find(descriptor.TypeName) IsNot Nil Then Throw New InvalidArgumentException("Duplicate control: " + descriptor.TypeName)
+        Array.Append(Me.mControls, descriptor)
+    End Sub
+
+    Public Function Find(typeName As String) As LayoutControlDescriptor
+        For Each descriptor As LayoutControlDescriptor In Me.mControls
+            If descriptor.TypeName = typeName Then Return descriptor
+        Next
+        ' Source uses Module.Class while stable metadata identities use Package.Class.
+        ' Never infer bare aliases, or guess when multiple modules expose one name.
+        If Not String.Contains(typeName, ".") Then Return Nil
+        Dim found As LayoutControlDescriptor
+        For Each descriptor As LayoutControlDescriptor In Me.mControls
+            If descriptor.Metadata.Value("sourceTypeName").AsString().Or("") = typeName Then
+                If found <> Nil Then Return Nil
+                found = descriptor
+            End If
+        Next
+        Return found
+    End Function
+
+    Public Function Controls() As Array Of LayoutControlDescriptor
+        Return Array.Clone(Me.mControls)
+    End Function
+
+    ''' Resolve a bare source type only through the document's actual imports.
+    Public Function FindSource(typeName As String, imports As Array Of String) As LayoutControlDescriptor
+        Dim exact As LayoutControlDescriptor = Me.Find(typeName)
+        If exact <> Nil Then Return exact
+        Dim found As LayoutControlDescriptor
+        For Each descriptor As LayoutControlDescriptor In Me.mControls
+            If descriptor.Metadata.Value("sourceTypeName").AsString().Or("") <> typeName Then Continue For
+            Dim sourceImport As String = descriptor.Metadata.Value("sourceImport").AsString().Or("")
+            For Each imported As String In imports
+                Dim matches As Boolean = imported = sourceImport
+                If imported = descriptor.PackageName And sourceImport = descriptor.PackageName + "." + descriptor.PackageName Then matches = True
+                If Not matches Then Continue For
+                If found <> Nil And found <> descriptor Then Return Nil
+                found = descriptor
+            Next
+        Next
+        Return found
+    End Function
+
+    Public Sub RegisterRenderer(typeName As String, renderer As LayoutRenderer)
+        If renderer Is Nil Then Throw New InvalidArgumentException("Renderer is required")
+        Dim descriptor As LayoutControlDescriptor = Me.Find(typeName)
+        If descriptor Is Nil Then Throw New InvalidArgumentException("Register the control before its renderer")
+        typeName = descriptor.TypeName
+        If String.Trim(renderer.RendererId()) = "" Then Throw New InvalidArgumentException("Renderer id is required")
+        If Me.RendererFor(typeName) IsNot Nil Then Throw New InvalidArgumentException("Duplicate renderer: " + typeName)
+        Array.Append(Me.mRendererTypes, typeName)
+        Array.Append(Me.mRenderers, renderer)
+    End Sub
+
+    Public Function RendererFor(typeName As String) As LayoutRenderer
+        Dim descriptor As LayoutControlDescriptor = Me.Find(typeName)
+        If descriptor <> Nil Then typeName = descriptor.TypeName
+        Dim index As Integer = Array.IndexOf(Me.mRendererTypes, typeName)
+        If index < 0 Then Return Nil
+        Return Me.mRenderers(index)
+    End Function
+
+    Public Sub RegisterEditor(editor As LayoutPropertyEditor)
+        If editor Is Nil Then Throw New InvalidArgumentException("Editor is required")
+        Dim id As String = editor.EditorId()
+        If String.Trim(id) = "" Then Throw New InvalidArgumentException("Editor id is required")
+        If Me.EditorFor(id) IsNot Nil Then Throw New InvalidArgumentException("Duplicate editor: " + id)
+        Array.Append(Me.mEditorIds, id)
+        Array.Append(Me.mEditors, editor)
+    End Sub
+
+    Public Function EditorFor(id As String) As LayoutPropertyEditor
+        Dim index As Integer = Array.IndexOf(Me.mEditorIds, id)
+        If index < 0 Then Return Nil
+        Return Me.mEditors(index)
+    End Function
+
+    Public Sub RegisterEditorView(factory As LayoutPropertyViewFactory)
+        If factory Is Nil Then Throw New InvalidArgumentException("Editor view factory is required")
+        Dim id As String = factory.EditorId()
+        If String.Trim(id) = "" Then Throw New InvalidArgumentException("Editor view id is required")
+        If Me.EditorViewFor(id) IsNot Nil Then Throw New InvalidArgumentException("Duplicate editor view: " + id)
+        Array.Append(Me.mViewIds, id)
+        Array.Append(Me.mViews, factory)
+    End Sub
+
+    Public Function EditorViewFor(id As String) As LayoutPropertyViewFactory
+        Dim index As Integer = Array.IndexOf(Me.mViewIds, id)
+        If index < 0 Then Return Nil
+        Return Me.mViews(index)
+    End Function
+
+    Private Shared Function Builtin(typeName As String, displayName As String, category As String, width As Integer, height As Integer, description As String) As LayoutControlDescriptor
+        Dim descriptor As New LayoutControlDescriptor(typeName, displayName)
+        descriptor.Category = category
+        descriptor.DefaultWidth = width
+        descriptor.DefaultHeight = height
+        descriptor.Description = description
+        Return descriptor
+    End Function
+
+    Private Shared Function NumberProperty(name As String, defaultExpression As String) As LayoutPropertyDescriptor
+        Dim prop As New LayoutPropertyDescriptor(name, "double", defaultExpression)
+        prop.Category = "Value"
+        Return prop
+    End Function
+
+    ''' Registers the core UI controls the Control grammar can declare without
+    ''' constructor arguments (Splitter needs one, so it is a glyph-only layout type).
+    ''' Property spellings are compiler-checked by tests/layoutkit_catalog_test.bui.
+    Public Sub RegisterBuiltinControls()
+        Dim names As Array Of String = ["Button", "Checkbox", "DisclosureTriangle", "Label", "TextField", "TextArea", "ComboBox", "RadioGroup", "Slider", "Stepper", "DateTimePicker", "View", "GroupBox", "TabView", "PagePanel", "ProgressBar", "ListBox", "ImageView", "Canvas", "HTMLView"]
+        ' Preflight prevents partial registration when any builtin is already present.
+        For Each typeName As String In names
+            If Me.Find(typeName) IsNot Nil Then Throw New InvalidArgumentException("Duplicate control: " + typeName)
+        Next
+        Dim button As LayoutControlDescriptor = LayoutCatalog.Builtin("Button", "Button", "Buttons", 100, 30, "Push button that runs an action when clicked")
+        button.AddProperty(New LayoutPropertyDescriptor("Caption", "string", "\"Button\""))
+        Me.Register(button)
+        Dim label As LayoutControlDescriptor = LayoutCatalog.Builtin("Label", "Label", "Text", 100, 20, "Static text")
+        label.AddProperty(New LayoutPropertyDescriptor("Text", "string", "\"Label\""))
+        Me.Register(label)
+        Dim field As LayoutControlDescriptor = LayoutCatalog.Builtin("TextField", "Text field", "Text", 180, 28, "Single-line editable text")
+        field.AddProperty(New LayoutPropertyDescriptor("Text", "string", "\"\""))
+        field.AddProperty(New LayoutPropertyDescriptor("Placeholder", "string", "\"\""))
+        field.AddProperty(New LayoutPropertyDescriptor("IsReadOnly", "boolean", "False"))
+        Dim fieldType As New LayoutPropertyDescriptor("FieldType", "enum", "FieldType.Normal")
+        fieldType.Options = ["FieldType.Normal", "FieldType.Password", "FieldType.Email", "FieldType.Number"]
+        fieldType.ConstructorParameter = "fieldType"
+        fieldType.ConstructorIndex = 0
+        field.AddProperty(fieldType)
+        Me.Register(field)
+        Dim checkbox As LayoutControlDescriptor = LayoutCatalog.Builtin("Checkbox", "Checkbox", "Buttons", 140, 30, "On, off or mixed toggle with a caption")
+        checkbox.AddProperty(New LayoutPropertyDescriptor("Caption", "string", "\"Checkbox\""))
+        Dim state As New LayoutPropertyDescriptor("Value", "enum", "Checkbox.CheckState.False")
+        state.Options = ["Checkbox.CheckState.False", "Checkbox.CheckState.True", "Checkbox.CheckState.Indeterminate"]
+        checkbox.AddProperty(state)
+        Me.Register(checkbox)
+        Dim triangle As LayoutControlDescriptor = LayoutCatalog.Builtin("DisclosureTriangle", "Disclosure triangle", "Buttons", 20, 20, "Expands or collapses related content")
+        triangle.AddProperty(New LayoutPropertyDescriptor("Expanded", "boolean", "False"))
+        Me.Register(triangle)
+        Dim area As LayoutControlDescriptor = LayoutCatalog.Builtin("TextArea", "Text area", "Text", 240, 120, "Multi-line editable text")
+        area.AddProperty(New LayoutPropertyDescriptor("Text", "string", "\"\""))
+        area.AddProperty(New LayoutPropertyDescriptor("IsReadOnly", "boolean", "False"))
+        area.AddProperty(New LayoutPropertyDescriptor("WordWrap", "boolean", "True"))
+        Me.Register(area)
+        Dim combo As LayoutControlDescriptor = LayoutCatalog.Builtin("ComboBox", "Combo box", "Input", 180, 28, "Pop-up list of choices, optionally editable")
+        Dim editable As New LayoutPropertyDescriptor("IsEditable", "boolean", "False")
+        editable.ConstructorParameter = "isEditable"
+        editable.ConstructorIndex = 0
+        combo.AddProperty(editable)
+        Me.Register(combo)
+        Me.Register(LayoutCatalog.Builtin("RadioGroup", "Radio group", "Input", 180, 80, "Mutually exclusive radio buttons"))
+        Dim slider As LayoutControlDescriptor = LayoutCatalog.Builtin("Slider", "Slider", "Input", 180, 24, "Picks a value from a continuous range")
+        slider.AddProperty(LayoutCatalog.NumberProperty("Minimum", "0.0"))
+        slider.AddProperty(LayoutCatalog.NumberProperty("Maximum", "100.0"))
+        slider.AddProperty(LayoutCatalog.NumberProperty("Value", "0.0"))
+        Dim orientation As New LayoutPropertyDescriptor("Orientation", "enum", "Orientation.Horizontal")
+        orientation.Options = ["Orientation.Horizontal", "Orientation.Vertical"]
+        slider.AddProperty(orientation)
+        Me.Register(slider)
+        Dim stepper As LayoutControlDescriptor = LayoutCatalog.Builtin("Stepper", "Stepper", "Input", 24, 30, "Up/down arrows that step a number")
+        stepper.AddProperty(LayoutCatalog.NumberProperty("Minimum", "0.0"))
+        stepper.AddProperty(LayoutCatalog.NumberProperty("Maximum", "100.0"))
+        stepper.AddProperty(LayoutCatalog.NumberProperty("Value", "0.0"))
+        stepper.AddProperty(LayoutCatalog.NumberProperty("Increment", "1.0"))
+        Me.Register(stepper)
+        Dim picker As LayoutControlDescriptor = LayoutCatalog.Builtin("DateTimePicker", "Date/time picker", "Input", 200, 28, "Edits a date, a time of day, or both")
+        Dim mode As New LayoutPropertyDescriptor("Mode", "enum", "DateTimePickerMode.DateTime")
+        mode.Options = ["DateTimePickerMode.Date", "DateTimePickerMode.Time", "DateTimePickerMode.DateTime"]
+        mode.ConstructorParameter = "mode"
+        mode.ConstructorIndex = 0
+        picker.AddProperty(mode)
+        Me.Register(picker)
+        Me.Register(LayoutCatalog.Builtin("View", "View", "Containers", 240, 160, "Plain container for grouping controls"))
+        Dim group As LayoutControlDescriptor = LayoutCatalog.Builtin("GroupBox", "Group box", "Containers", 240, 160, "Titled border around related controls")
+        group.AddProperty(New LayoutPropertyDescriptor("Caption", "string", "\"Group\""))
+        Me.Register(group)
+        Me.Register(LayoutCatalog.Builtin("TabView", "Tab view", "Containers", 320, 220, "Tabbed pages of content"))
+        Me.Register(LayoutCatalog.Builtin("PagePanel", "Page panel", "Containers", 320, 220, "Stack of pages showing one at a time"))
+        Dim progress As LayoutControlDescriptor = LayoutCatalog.Builtin("ProgressBar", "Progress bar", "Indicators", 200, 20, "Shows task progress")
+        progress.AddProperty(LayoutCatalog.NumberProperty("Minimum", "0.0"))
+        progress.AddProperty(LayoutCatalog.NumberProperty("Maximum", "100.0"))
+        progress.AddProperty(LayoutCatalog.NumberProperty("Value", "0.0"))
+        progress.AddProperty(New LayoutPropertyDescriptor("Indeterminate", "boolean", "False"))
+        Me.Register(progress)
+        Dim list As LayoutControlDescriptor = LayoutCatalog.Builtin("ListBox", "List box", "Data", 240, 160, "Scrolling list or table of rows")
+        list.AddProperty(LayoutCatalog.NumberProperty("DefaultRowHeight", "24.0"))
+        Me.Register(list)
+        Dim image As LayoutControlDescriptor = LayoutCatalog.Builtin("ImageView", "Image view", "Media", 160, 120, "Displays a picture")
+        Dim scaling As New LayoutPropertyDescriptor("ScaleMode", "enum", "ScaleMode.Fit")
+        scaling.Options = ["ScaleMode.Fit", "ScaleMode.Fill", "ScaleMode.Stretch", "ScaleMode.Center"]
+        image.AddProperty(scaling)
+        Me.Register(image)
+        Me.Register(LayoutCatalog.Builtin("Canvas", "Canvas", "Media", 200, 150, "Custom drawing surface"))
+        Dim web As LayoutControlDescriptor = LayoutCatalog.Builtin("HTMLView", "HTML view", "Media", 320, 240, "Embedded web content")
+        web.AddProperty(New LayoutPropertyDescriptor("URL", "string", "\"\""))
+        Me.Register(web)
+    End Sub
+End Class

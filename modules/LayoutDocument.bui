@@ -1,0 +1,1847 @@
+Import editorkit
+
+' Source spans are half-open UTF-8 byte ranges, never character offsets.
+Private Class LDToken
+    Public Property Text As String
+    Public Property First As Integer
+    Public Property Last As Integer
+    Public Sub Constructor(text As String, first As Integer, last As Integer)
+        Me.Text = text
+        Me.First = first
+        Me.Last = last
+    End Sub
+End Class
+
+Private Class LDLine
+    Public Property Tokens As Array Of LDToken = []
+    Public Property Comment As Boolean = False
+    Public Property Broken As Boolean = False
+End Class
+
+Private Function LDChar(text As String, offset As Integer) As String
+    Return String.SubstringBytes(text, offset, 1)
+End Function
+
+Private Function LDWordByte(c As Integer, first As Boolean) As Boolean
+    If c >= 65 And c <= 90 Then Return True
+    If c >= 97 And c <= 122 Then Return True
+    If c = 95 Or c >= 128 Then Return True
+    Return Not first And c >= 48 And c <= 57
+End Function
+
+Private Function LDIdentifier(identifier As String) As Boolean
+    Dim data As Bytes = Bytes.FromString(identifier, Text.Encodings.UTF8)
+    If data.Count = 0 Then Return False
+    For i As Integer = 0 To data.Count - 1
+        If Not LDWordByte(data.Item(i), i = 0) Then Return False
+    Next
+    Return True
+End Function
+
+' Comments and quoted text are consumed before interpreting structural tokens.
+Private Class LDLexer
+    Private Property mCommentDepth As Integer = 0
+    Public Property InComment As Boolean
+        Get
+            Return Me.mCommentDepth > 0
+        End Get
+    End Property
+    Public Function Scan(text As String, baseByte As Integer) As LDLine
+        Dim scanned As New LDLine()
+        Dim size As Integer = String.LenBytes(text)
+        Dim i As Integer = 0
+        While i < size
+            Dim c As String = LDChar(text, i)
+            Dim pair As String = String.SubstringBytes(text, i, Math.Min(2, size - i))
+            If Me.InComment Then
+                scanned.Comment = True
+                If pair = "*/" Then
+                    Me.mCommentDepth -= 1
+                    i += 2
+                ElseIf pair = "/*" Then
+                    Me.mCommentDepth += 1
+                    i += 2
+                Else
+                    i += 1
+                End If
+                Continue While
+            End If
+            If c = " " Or c = "\t" Then
+                i += 1
+                Continue While
+            End If
+            If c = "'" Or pair = "//" Then Exit While
+            If pair = "/*" Then
+                scanned.Comment = True
+                Me.mCommentDepth += 1
+                i += 2
+                Continue While
+            End If
+            Dim start As Integer = i
+            If c = "\"" Then
+                i += 1
+                Dim closed As Boolean = False
+                While i < size
+                    c = LDChar(text, i)
+                    If String.Asc(c) < 32 Then scanned.Broken = True
+                    i += 1
+                    If c = "\"" Then
+                        closed = True
+                        Exit While
+                    End If
+                    If c = "\\" Then
+                        If i >= size Then Exit While
+                        Dim escaped As String = LDChar(text, i)
+                        If escaped <> "n" And escaped <> "r" And escaped <> "t" And escaped <> "\"" And escaped <> "\\" Then scanned.Broken = True
+                        i += 1
+                    End If
+                End While
+                If Not closed Then scanned.Broken = True
+            ElseIf LDWordByte(String.Asc(c), True) Then
+                i += 1
+                While i < size
+                    If Not LDWordByte(String.Asc(LDChar(text, i)), False) Then Exit While
+                    i += 1
+                End While
+            ElseIf c >= "0" And c <= "9" Then
+                i += 1
+                While i < size
+                    c = LDChar(text, i)
+                    If c < "0" Or c > "9" Then Exit While
+                    i += 1
+                End While
+            ElseIf pair = "<=" Or pair = ">=" Then
+                i += 2
+            Else
+                i += 1
+            End If
+            Array.Append(scanned.Tokens, New LDToken(String.SubstringBytes(text, start, i - start), baseByte + start, baseByte + i))
+        End While
+        Return scanned
+    End Function
+End Class
+
+' Literal subset: decimal numbers, strings, booleans, qualified symbolic names.
+' No expression evaluator, coercions, enum guesses, or executable substitutions.
+Private Function LDLiteral(raw As String) As String
+    Dim size As Integer = String.LenBytes(raw)
+    If size = 0 Then Return ""
+    If String.Contains(raw, "\n", True) Or String.Contains(raw, "\r", True) Then Return ""
+    Dim lexer As New LDLexer()
+    Dim line As LDLine = lexer.Scan(raw, 0)
+    If line.Broken Or line.Comment Or lexer.InComment Then Return ""
+    Dim count As Integer = Array.Count(line.Tokens)
+    If count = 0 Then Return ""
+    If line.Tokens(0).First <> 0 Or line.Tokens(count - 1).Last <> size Then Return ""
+    If count = 1 Then
+        If String.Left(raw, 1) = "\"" Then Return "string"
+        If raw = "True" Or raw = "False" Then Return "boolean"
+    End If
+    Dim segments As Array Of String = String.Split(raw, ".")
+    If Array.Count(segments) >= 2 Then
+        Dim symbolic As Boolean = True
+        For Each segment As String In segments
+            If Not LDIdentifier(segment) Then symbolic = False
+        Next
+        If symbolic Then Return "symbol"
+    End If
+    Return LDNumberKind(raw)
+End Function
+
+' Recognize decimal syntax before using the runtime parser; NaN/Infinity and
+' overflowing integers/floats are never accepted as editable literals.
+Private Function LDNumberKind(raw As String) As String
+    If raw = "" Then Return ""
+    Dim size As Integer = String.LenBytes(raw)
+    Dim cursor As Integer = 0
+    If LDChar(raw, 0) = "+" Then Return ""
+    If LDChar(raw, 0) = "-" Then cursor = 1
+    Dim firstDigit As Integer = cursor
+    While cursor < size
+        Dim ch As String = LDChar(raw, cursor)
+        If ch < "0" Or ch > "9" Then Exit While
+        cursor += 1
+    End While
+    If cursor = firstDigit Then Return ""
+    Dim floating As Boolean = False
+    If cursor < size Then
+        If LDChar(raw, cursor) = "." Then
+            floating = True
+            cursor += 1
+            Dim fractionStart As Integer = cursor
+            While cursor < size
+                Dim ch As String = LDChar(raw, cursor)
+                If ch < "0" Or ch > "9" Then Exit While
+                cursor += 1
+            End While
+            If cursor = fractionStart Then Return ""
+        End If
+    End If
+    If cursor < size Then
+        Dim ch As String = LDChar(raw, cursor)
+        If ch = "e" Or ch = "E" Then
+            floating = True
+            cursor += 1
+            If cursor < size Then
+                If LDChar(raw, cursor) = "+" Or LDChar(raw, cursor) = "-" Then cursor += 1
+            End If
+            Dim exponentStart As Integer = cursor
+            While cursor < size
+                ch = LDChar(raw, cursor)
+                If ch < "0" Or ch > "9" Then Exit While
+                cursor += 1
+            End While
+            If cursor = exponentStart Then Return ""
+        End If
+    End If
+    If cursor <> size Then Return ""
+    If floating Then
+        Dim parsed As Result Of Double, String = Double.Parse(raw)
+        If parsed.IsErr Then Return ""
+        Dim number As Double = parsed.Value
+        If Not (number >= -1.7976931348623157e308 And number <= 1.7976931348623157e308) Then Return ""
+        Return "double"
+    End If
+    Dim digits As String = String.SubstringBytes(raw, firstDigit)
+    While String.LenBytes(digits) > 1 And String.Left(digits, 1) = "0"
+        digits = String.SubstringBytes(digits, 1)
+    End While
+    Dim limit As String = "9223372036854775807"
+    If LDChar(raw, 0) = "-" Then limit = "9223372036854775808"
+    If String.LenBytes(digits) > 19 Then Return ""
+    If String.LenBytes(digits) = 19 And String.Compare(digits, limit, True) > 0 Then Return ""
+    Dim parsed As Result Of Integer, String = Integer.Parse(raw)
+    If parsed.IsErr Then Return ""
+    Return "integer"
+End Function
+
+Private Class LDProperty
+    Public Property Name As String
+    Public Property Raw As String
+    Public Property Kind As String
+    Public Property First As Integer
+    Public Property Last As Integer
+    Public Property Safe As Boolean = False
+    Public Property Components As Array Of LDToken = []
+End Class
+
+Private Function LDName(name As String) As Boolean
+    If Not LDIdentifier(name) Then Return False
+    Return Not String.Contains("|abstract|alias|class|const|declare|dim|enum|export|final|flags|function|get|implements|import|inherits|interface|lib|operator|overrides|packed|paramarray|private|property|protected|public|readonly|set|shared|structure|sub|var|array|boolean|double|integer|optional|ptr|result|single|string|break|case|continue|do|downto|else|elseif|end|exit|for|if|loop|next|return|select|step|then|to|until|wend|while|and|as|ctype|each|in|is|isa|isnot|me|mod|new|not|of|or|super|trycast|weak|xor|false|nil|none|ok|some|true|print|sequential|stderr|stdin|stdout|err|math|path|random|addressof|assigns|async|await|block|byref|call|catch|cfstringref|closure|condition|constant|cstring|currency|delegate|event|extension|finally|inline|internal|lambda|lazy|localization|mainthread|module|mutex|namespace|package|partial|raiseevent|runloop|selector|synclock|task|thread|throw|treat|try|using|with|int8|int16|int32|int64|uint8|uint16|uint32|uint64|handle|safearea|priority|constraints|control|window|view|", "|" + String.LCase(name) + "|", True)
+End Function
+
+Private Function LDLayoutProperty(name As String) As Boolean
+    Return String.Contains("|constraints|layout|lockleft|lockright|locktop|lockbottom|leadinganchor|trailinganchor|topanchor|bottomanchor|widthanchor|heightanchor|centerxanchor|centeryanchor|baselineanchor|", "|" + String.LCase(name) + "|", True)
+End Function
+
+''' Names safe for scalar property insertion. Geometry has dedicated commands.
+Public Function LayoutWritablePropertyName(name As String) As Boolean
+    If Not LDName(name) Or LDLayoutProperty(name) Then Return False
+    Return Not String.Contains("|frame|x|y|width|height|left|top|right|bottom|bounds|size|position|", "|" + String.LCase(name) + "|", True)
+End Function
+
+Private Function LDPath(name As String) As Boolean
+    For Each part As String In String.Split(name, ".")
+        If Not LDName(part) Then Return False
+    Next
+    Return name <> ""
+End Function
+
+Private Function LDRoot(node As LDNode) As LDNode
+    While node.Parent <> Nil
+        node = node.Parent
+    End While
+    Return node
+End Function
+
+Private Function LDAnchor(anchor As String) As Integer
+    Select Case anchor
+        Case "LeadingAnchor", "TrailingAnchor", "CenterXAnchor"
+            Return 1
+        Case "TopAnchor", "BottomAnchor", "CenterYAnchor", "BaselineAnchor"
+            Return 2
+        Case "WidthAnchor", "HeightAnchor"
+            Return 3
+    End Select
+    Return 0
+End Function
+
+Private Function LDPriority(priority As String) As Boolean
+    If priority = "Required" Or priority = "High" Or priority = "Medium" Or priority = "Low" Then Return True
+    If LDNumberKind(priority) <> "integer" Then Return False
+    Dim value As Integer = Integer.Parse(priority).Or(0)
+    Return value >= 1 And value <= 1000
+End Function
+
+' Keep unchanged constraint tokens and all surrounding source trivia. Only
+' differing token runs are replaced, including changes in relation/sign/priority.
+Private Function LDTokenEdits(original As Array Of LDToken, text As String) As Array Of EditorEdit
+    Dim lexer As New LDLexer()
+    Dim replacement As Array Of LDToken = lexer.Scan(text, 0).Tokens
+    Dim n As Integer = Array.Count(original)
+    Dim m As Integer = Array.Count(replacement)
+    Dim stride As Integer = m + 1
+    Dim scores As Array Of Integer = []
+    For k As Integer = 0 To (n + 1) * stride - 1
+        Array.Append(scores, 0)
+    Next
+    For i As Integer = n - 1 To 0 Step -1
+        For j As Integer = m - 1 To 0 Step -1
+            If original(i).Text = replacement(j).Text Then
+                scores(i * stride + j) = 1 + scores((i + 1) * stride + j + 1)
+            Else
+                scores(i * stride + j) = Math.Max(scores((i + 1) * stride + j), scores(i * stride + j + 1))
+            End If
+        Next
+    Next
+    Dim oldMatches As Array Of Integer = []
+    Dim newMatches As Array Of Integer = []
+    Dim i As Integer = 0
+    Dim j As Integer = 0
+    While i < n And j < m
+        If original(i).Text = replacement(j).Text Then
+            Array.Append(oldMatches, i)
+            Array.Append(newMatches, j)
+            i += 1
+            j += 1
+        ElseIf scores((i + 1) * stride + j) >= scores(i * stride + j + 1) Then
+            i += 1
+        Else
+            j += 1
+        End If
+    End While
+    Array.Append(oldMatches, n)
+    Array.Append(newMatches, m)
+    Dim edits As Array Of EditorEdit = []
+    Dim oldStart As Integer = 0
+    Dim newStart As Integer = 0
+    For k As Integer = 0 To Array.Count(oldMatches) - 1
+        Dim oldEnd As Integer = oldMatches(k)
+        Dim newEnd As Integer = newMatches(k)
+        If oldStart < oldEnd Or newStart < newEnd Then
+            Dim first As Integer = original(n - 1).Last
+            If oldStart < n Then first = original(oldStart).First
+            Dim last As Integer = first
+            If oldStart < oldEnd Then last = original(oldEnd - 1).Last
+            Dim value As String = ""
+            If newStart < newEnd Then
+                value = String.SubstringBytes(text, replacement(newStart).First, replacement(newEnd - 1).Last - replacement(newStart).First)
+                If oldStart = oldEnd Then
+                    If oldEnd = n Then
+                        value = " " + value
+                    Else
+                        value += " "
+                    End If
+                End If
+            End If
+            Array.Append(edits, New EditorEdit(first, last, value))
+        End If
+        oldStart = oldEnd + 1
+        newStart = newEnd + 1
+    Next
+    Return edits
+End Function
+
+Private Class LDConstraint
+    Public Property Root As LDNode
+    Public Property Tokens As Array Of LDToken = []
+    Public Property First As Integer
+    Public Property Last As Integer
+    Public Property LineFirst As Integer
+    Public Property LineLast As Integer
+    Public Property Safe As Boolean = True
+End Class
+
+Private Class LDNode
+    Public Property First As Integer
+    Public Property Last As Integer
+    Public Property CloseByte As Integer
+    Public Property NameToken As LDToken
+    Public Property Indent As String
+    Public Property ConstraintClose As Integer = -1
+    Public Property Constrained As Boolean = False
+    Public Property Id As String
+    Public Property TypeName As String
+    Public Property Name As String
+    Public Property Parent As LDNode = Nil
+    Public Property BlockKind As String
+    Public Property Unsafe As Boolean = False
+    Public Property Closed As Boolean = False
+    Public Property Properties As Array Of LDProperty = []
+    Public Property Frame As LDProperty = Nil
+End Class
+
+' Immutable property from a source snapshot. RawValue excludes trailing comments.
+Public Class LayoutProperty
+    Private Property mName As String
+    Private Property mRawValue As String
+    Private Property mEditable As Boolean
+    Public Sub Constructor(name As String, rawValue As String, editable As Boolean)
+        Me.mName = name
+        Me.mRawValue = rawValue
+        Me.mEditable = editable
+    End Sub
+    Public Property Name As String
+        Get
+            Return Me.mName
+        End Get
+    End Property
+    Public Property RawValue As String
+        Get
+            Return Me.mRawValue
+        End Get
+    End Property
+    Public Property Editable As Boolean
+        Get
+            Return Me.mEditable
+        End Get
+    End Property
+End Class
+
+' Immutable node. Id is a source-byte identity valid only within this snapshot.
+Public Class LayoutNode
+    Private Property mId As String
+    Private Property mTypeName As String
+    Private Property mName As String
+    Private Property mParentId As String
+    Private Property mX As Integer
+    Private Property mY As Integer
+    Private Property mWidth As Integer
+    Private Property mHeight As Integer
+    Private Property mEditable As Boolean
+    Private Property mProperties As Array Of LayoutProperty = []
+    Private Property mHasLiteralFrame As Boolean
+    Public Sub Constructor(id As String, typeName As String, name As String, parentId As String, x As Integer, y As Integer, width As Integer, height As Integer, editable As Boolean, properties As Array Of LayoutProperty, hasLiteralFrame As Boolean = False)
+        Me.mId = id
+        Me.mTypeName = typeName
+        Me.mName = name
+        Me.mParentId = parentId
+        Me.mX = x
+        Me.mY = y
+        Me.mWidth = width
+        Me.mHeight = height
+        Me.mEditable = editable
+        Me.mHasLiteralFrame = hasLiteralFrame
+        For Each item As LayoutProperty In properties
+            Array.Append(Me.mProperties, item)
+        Next
+    End Sub
+    Public Property Id As String
+        Get
+            Return Me.mId
+        End Get
+    End Property
+    Public Property TypeName As String
+        Get
+            Return Me.mTypeName
+        End Get
+    End Property
+    Public Property Name As String
+        Get
+            Return Me.mName
+        End Get
+    End Property
+    Public Property ParentId As String
+        Get
+            Return Me.mParentId
+        End Get
+    End Property
+    Public Property X As Integer
+        Get
+            Return Me.mX
+        End Get
+    End Property
+    Public Property Y As Integer
+        Get
+            Return Me.mY
+        End Get
+    End Property
+    Public Property Width As Integer
+        Get
+            Return Me.mWidth
+        End Get
+    End Property
+    Public Property Height As Integer
+        Get
+            Return Me.mHeight
+        End Get
+    End Property
+    Public Property Editable As Boolean
+        Get
+            Return Me.mEditable
+        End Get
+    End Property
+    Public Property Properties As Array Of LayoutProperty
+        Get
+            Dim copied As Array Of LayoutProperty = []
+            For Each item As LayoutProperty In Me.mProperties
+                Array.Append(copied, item)
+            Next
+            Return copied
+        End Get
+    End Property
+    ''' Declared frame geometry is available for preview, even when constraints
+    ''' prevent direct manipulation. This does not claim a solved constraint frame.
+    Public Property HasLiteralFrame As Boolean
+        Get
+            Return Me.mHasLiteralFrame
+        End Get
+    End Property
+End Class
+
+Private Function LDReadable(node As LDNode) As Boolean
+    Dim current As LDNode = node
+    While current <> Nil
+        If current.Unsafe Or Not current.Closed Then Return False
+        current = current.Parent
+    End While
+    Return True
+End Function
+
+Private Sub LDTaintRoot(node As LDNode)
+    If node = Nil Then Return
+    Dim current As LDNode = node
+    While current.Parent <> Nil
+        current = current.Parent
+    End While
+    current.Unsafe = True
+End Sub
+
+Private Function LDCodeBlock(tokens As Array Of LDToken) As String
+    For Each token As LDToken In tokens
+        Dim word As String = String.LCase(token.Text)
+        If word = "public" Or word = "private" Or word = "protected" Or word = "shared" Or word = "overrides" Or word = "exported" Or word = "async" Or word = "sequential" Or word = "packed" Or word = "flags" Then Continue For
+        If word = "class" Or word = "structure" Or word = "interface" Or word = "enum" Or word = "sub" Or word = "function" Then Return word
+        Return ""
+    Next
+    Return ""
+End Function
+
+' Apply non-overlapping absolute edits inside [start, finish) of source.
+Private Function LDSlice(source As String, start As Integer, finish As Integer, edits As Array Of EditorEdit) As String
+    Dim ordered As Array Of EditorEdit = []
+    For Each item As EditorEdit In edits
+        If item.StartByte < start Or item.EndByte > finish Then Continue For
+        Dim at As Integer = Array.Count(ordered)
+        While at > 0
+            If ordered(at - 1).StartByte <= item.StartByte Then Exit While
+            at -= 1
+        End While
+        Array.Insert(ordered, at, item)
+    Next
+    Dim text As String = ""
+    Dim cursor As Integer = start
+    For Each item As EditorEdit In ordered
+        text += String.SubstringBytes(source, cursor, item.StartByte - cursor) + item.Replacement
+        cursor = item.EndByte
+    Next
+    Return text + String.SubstringBytes(source, cursor, finish - cursor)
+End Function
+
+' Move whole lines from one indentation base to another. Lines that do not start
+' with the old base (for example column-0 comments) are left untouched.
+Private Function LDReindent(text As String, fromIndent As String, toIndent As String) As String
+    If String.Compare(fromIndent, toIndent, True) = 0 Then Return text
+    Dim lines As Array Of String = String.Split(text, "\n")
+    Dim size As Integer = String.LenBytes(fromIndent)
+    For i As Integer = 0 To Array.Count(lines) - 1
+        Dim line As String = lines(i)
+        If line = "" Or line = "\r" Then Continue For
+        If size = 0 Then
+            lines(i) = toIndent + line
+        ElseIf String.Compare(String.LeftBytes(line, size), fromIndent, True) = 0 Then
+            lines(i) = toIndent + String.SubstringBytes(line, size)
+        End If
+    Next
+    Return String.Join(lines, "\n")
+End Function
+
+' Built-in runtime controls never need a source import when pasted.
+Private Function LDBuiltinControl(typeName As String) As Boolean
+    Return String.Contains("|button|canvas|checkbox|combobox|datetimepicker|disclosuretriangle|groupbox|htmlview|imageview|label|listbox|pagepanel|popupmenu|progressbar|radiobutton|radiogroup|scrollview|searchfield|segmentedcontrol|slider|splitter|stackview|stepper|switch|tabview|textarea|textfield|view|", "|" + String.LCase(typeName) + "|", True)
+End Function
+
+Private Function LDIndex(items As Array Of LDNode, node As LDNode) As Integer
+    For i As Integer = 0 To Array.Count(items) - 1
+        If items(i) = node Then Return i
+    Next
+    Return -1
+End Function
+
+' Control identities are case-insensitive within a root.
+Private Function LDHasName(names As Array Of String, name As String) As Boolean
+    For Each item As String In names
+        If String.LCase(item) = String.LCase(name) Then Return True
+    Next
+    Return False
+End Function
+
+Private Function LDNextName(name As String, taken As Array Of String) As String
+    Dim size As Integer = String.LenBytes(name)
+    Dim cut As Integer = size
+    While cut > 1
+        Dim c As String = String.SubstringBytes(name, cut - 1, 1)
+        If c < "0" Or c > "9" Then Exit While
+        cut -= 1
+    End While
+    Dim base As String = String.LeftBytes(name, cut)
+    Dim number As Integer = 1
+    If size - cut >= 10 Then
+        base = name
+        cut = size
+    End If
+    If cut < size Then number = Integer.Parse(String.SubstringBytes(name, cut)).Or(1)
+    For attempt As Integer = 1 To 100000
+        number += 1
+        Dim candidate As String = base + String.From(number)
+        If LDName(candidate) And Not LDHasName(taken, candidate) Then Return candidate
+    Next
+    Throw New InvalidArgumentException("Could not find a free control name for " + name)
+End Function
+
+Private Function LDSnippetMarker() As String
+    Return "' buoy-layout-snippet: 1"
+End Function
+
+Private Function LDSnippetImport() As String
+    Return "' buoy-layout-import: "
+End Function
+
+Private Function LDSnippetRoot() As String
+    Return "BuoyLayoutSnippetRoot"
+End Function
+
+''' Paste/embed plans: Edits address the original snapshot and must be applied
+''' atomically against LayoutDocument.Version. Names lists the final top-level
+''' control names (after uniquifying) so hosts can select them after reloading.
+Public Class LayoutPastePlan
+    Public Property Edits As Array Of EditorEdit = []
+    Public Property Names As Array Of String = []
+    ''' Import lines this plan adds (empty when every recorded import is present).
+    Public Property Imports As Array Of String = []
+End Class
+
+' Headless, immutable source snapshot. The host must compare Version before applying edits.
+' Rejected requests throw InvalidArgumentException; this object never applies edits or owns undo.
+Public Class LayoutDocument
+    Private Property mSource As String
+    Private Property mVersion As Integer
+    Private Property mRecords As Array Of LDNode = []
+    Private Property mNodes As Array Of LayoutNode = []
+    Private Property mBroken As Boolean = False
+    Private Property mConstraints As Array Of LDConstraint = []
+    Private Property mInterior As Array Of Integer = []
+    Private Property mInteriorReady As Boolean = False
+    ' Exact (case-sensitive) node id -> index into mRecords and mNodes, which
+    ' Publish keeps aligned. Built once; snapshots never change afterwards.
+    Private Property mIndex As Map Of String, Integer
+    Private Property mImports As Array Of String = []
+    Private Property mImportsReady As Boolean = False
+
+    Public Sub Constructor(sourceText As String, version As Integer = 1)
+        If version < 1 Then Throw New InvalidArgumentException("Layout version must be positive")
+        Me.mSource = sourceText
+        Me.mVersion = version
+        Me.mIndex = New Map Of String, Integer()
+        Dim document As New EditorDocument(sourceText, 0)
+        Me.Scan(document)
+        Me.Publish()
+    End Sub
+
+    Public Property SourceText As String
+        Get
+            Return Me.mSource
+        End Get
+    End Property
+    Public Property Version As Integer
+        Get
+            Return Me.mVersion
+        End Get
+    End Property
+    ''' A fresh copy in declaration order on every read (callers may mutate it).
+    ''' Hot loops should read it once, or use NodeCount/NodeAt, which do not copy.
+    Public Property Nodes As Array Of LayoutNode
+        Get
+            Return Array.Clone(Me.mNodes)
+        End Get
+    End Property
+
+    ''' Number of nodes; NodeAt(0 To NodeCount() - 1) walks Nodes without copying.
+    Public Function NodeCount() As Integer
+        Return Array.Count(Me.mNodes)
+    End Function
+
+    ''' The node at a declaration-order index; throws OutOfBoundsException when out of range.
+    Public Function NodeAt(index As Integer) As LayoutNode
+        Return Me.mNodes(index)
+    End Function
+
+    ' Exact, case-sensitive id lookup; -1 when unknown (including "").
+    Private Function IndexOf(id As String) As Integer
+        Return Me.mIndex.Get(id).Or(-1)
+    End Function
+
+    ''' The node with exactly this opaque id, or Nil. O(1); no fallback scan.
+    Public Function FindNode(id As String) As LayoutNode
+        Dim index As Integer = Me.IndexOf(id)
+        If index < 0 Then Return Nil
+        Return Me.mNodes(index)
+    End Function
+
+    ''' Declaration byte offset in this immutable source snapshot. IDs stay opaque.
+    Public Function DeclarationStartByte(id As String) As Integer
+        Dim index As Integer = Me.IndexOf(id)
+        If index < 0 Then Throw New InvalidArgumentException("Unknown layout node")
+        Return Me.mRecords(index).First
+    End Function
+
+    Private Sub Scan(document As EditorDocument)
+        Dim lexer As New LDLexer()
+        Dim stack As Array Of LDNode = []
+        Dim opaque As Array Of String = []
+        Dim constraintRoot As LDNode = Nil
+        Dim conditional As Integer = 0
+        Dim continuation As Integer = 0
+        Dim continuedLine As Boolean = False
+        For lineIndex As Integer = 0 To document.LineCount - 1
+            Dim line As LDLine = lexer.Scan(document.LineText(lineIndex), document.LineStartByte(lineIndex))
+            If line.Broken Then Me.mBroken = True
+            Dim tokens As Array Of LDToken = line.Tokens
+            Dim count As Integer = Array.Count(tokens)
+            If count = 0 Then Continue For
+            Dim current As LDNode = Nil
+            If Array.Count(stack) > 0 Then current = Array.Last(stack)
+            Dim first As String = String.LCase(tokens(0).Text)
+            Dim second As String = ""
+            If count > 1 Then second = String.LCase(tokens(1).Text)
+            If constraintRoot <> Nil Then
+                If first = "end" And second = "constraints" And count = 2 Then
+                    constraintRoot.ConstraintClose = document.LineStartByte(lineIndex)
+                    constraintRoot = Nil
+                Else
+                    Dim item As New LDConstraint()
+                    item.Root = constraintRoot
+                    item.Tokens = tokens
+                    item.First = tokens(0).First
+                    item.Last = Array.Last(tokens).Last
+                    item.LineFirst = document.LineStartByte(lineIndex)
+                    item.LineLast = String.LenBytes(Me.mSource)
+                    If lineIndex + 1 < document.LineCount Then item.LineLast = document.LineStartByte(lineIndex + 1)
+                    Array.Append(Me.mConstraints, item)
+                    item.Safe = Not line.Comment And Not line.Broken
+                End If
+                Continue For
+            End If
+            If current <> Nil And first = "constraints" And count = 1 Then
+                If current.Parent <> Nil Or current.Constrained Then
+                    LDTaintRoot(current)
+                Else
+                    current.Constrained = True
+                    constraintRoot = current
+                End If
+                Continue For
+            End If
+            If first = "#" Then
+                LDTaintRoot(current)
+                If second = "if" Then conditional += 1
+                If second = "end" And count >= 3 Then
+                    If tokens(2).Text = "If" Then conditional = Math.Max(0, conditional - 1)
+                End If
+                Continue For
+            End If
+            If conditional > 0 Then Continue For
+            If Array.Count(opaque) > 0 Then
+                If first = "end" And second = Array.Last(opaque) Then
+                    Array.RemoveAt(opaque, Array.Count(opaque) - 1)
+                Else
+                    Dim nested As String = LDCodeBlock(tokens)
+                    ' Interface members are signatures, not procedure blocks.
+                    If Array.Last(opaque) <> "interface" And nested <> "" Then Array.Append(opaque, nested)
+                End If
+                Continue For
+            End If
+            If continuation > 0 Or continuedLine Then
+                continuedLine = False
+                LDTaintRoot(current)
+                For Each token As LDToken In tokens
+                    If token.Text = "(" Or token.Text = "[" Or token.Text = "{" Then continuation += 1
+                    If token.Text = ")" Or token.Text = "]" Or token.Text = "}" Then continuation -= 1
+                Next
+                continuation = Math.Max(0, continuation)
+                If Array.Last(tokens).Text = "_" Then continuedLine = True
+                Continue For
+            End If
+            Dim codeKind As String = LDCodeBlock(tokens)
+            If codeKind <> "" Then
+                LDTaintRoot(current)
+                Array.Append(opaque, codeKind)
+                Continue For
+            End If
+            Dim header As Integer = 0
+            If first = "public" Or first = "private" Then header = 1
+            Dim rootWord As String = ""
+            If count > header Then rootWord = String.LCase(tokens(header).Text)
+            Dim root As Boolean = current = Nil And (rootWord = "window" Or rootWord = "view") And count >= header + 2
+            Dim child As Boolean = current <> Nil And first = "control" And count >= 3
+            If root Or child Then
+                Dim nameIndex As Integer = header + 1
+                If child Then
+                    nameIndex = 2
+                    While nameIndex + 1 < count
+                        If tokens(nameIndex).Text <> "." Then Exit While
+                        nameIndex += 2
+                    End While
+                End If
+                If nameIndex >= count Then
+                    LDTaintRoot(current)
+                    Continue For
+                End If
+                If Not LDIdentifier(tokens(nameIndex).Text) Then
+                    LDTaintRoot(current)
+                    Continue For
+                End If
+                If child And Not LDIdentifier(tokens(1).Text) Then
+                    LDTaintRoot(current)
+                    Continue For
+                End If
+                Dim node As New LDNode()
+                node.Id = "node:" + String.From(tokens(0).First)
+                node.Name = tokens(nameIndex).Text
+                node.NameToken = tokens(nameIndex)
+                node.First = document.LineStartByte(lineIndex)
+                node.Indent = String.SubstringBytes(Me.mSource, node.First, tokens(0).First - node.First)
+                node.TypeName = tokens(header).Text
+                node.BlockKind = rootWord
+                If child Then
+                    node.TypeName = String.SubstringBytes(Me.mSource, tokens(1).First, tokens(nameIndex - 1).Last - tokens(1).First)
+                    node.BlockKind = first
+                End If
+                node.Parent = current
+                ' Existing contextual identifiers such as "ok" are accepted by
+                ' the compiler. The stricter new-name gate applies only to commands.
+                node.Unsafe = line.Comment Or line.Broken
+                If child And Not LDPath(node.TypeName) And node.TypeName <> "View" Then node.Unsafe = True
+                If root And count <> header + 2 Then node.Unsafe = True
+                If child And count <> nameIndex + 1 Then node.Unsafe = True
+                For Each previous As LDNode In Me.mRecords
+                    If (LDRoot(previous) = LDRoot(node) Or previous.Parent = Nil And node.Parent = Nil) And String.LCase(previous.Name) = String.LCase(node.Name) Then
+                        previous.Unsafe = True
+                        node.Unsafe = True
+                        LDTaintRoot(node)
+                    End If
+                Next
+                Array.Append(Me.mRecords, node)
+                Array.Append(stack, node)
+                Continue For
+            End If
+            If current = Nil And first = "end" Then
+                If second = "window" Or second = "view" Or second = "control" Then Me.mBroken = True
+            End If
+            If current <> Nil Then
+                If first = "end" And second = current.BlockKind And count = 2 Then
+                    ' A closing-line block comment may extend beyond the node's
+                    ' whole-line edit span. Refuse edits rather than orphan its tail.
+                    If lexer.InComment Or line.Broken Then current.Unsafe = True
+                    current.Closed = True
+                    current.CloseByte = document.LineStartByte(lineIndex)
+                    current.Last = String.LenBytes(Me.mSource)
+                    If lineIndex + 1 < document.LineCount Then current.Last = document.LineStartByte(lineIndex + 1)
+                    Array.RemoveAt(stack, Array.Count(stack) - 1)
+                    Continue For
+                End If
+                If count >= 3 And LDIdentifier(tokens(0).Text) And second = "=" Then
+                    Me.ReadProperty(current, tokens, line.Comment Or line.Broken)
+                Else
+                    LDTaintRoot(current)
+                End If
+            End If
+            ' Never discover a layout inside a multi-line expression or continuation.
+            For Each token As LDToken In tokens
+                If token.Text = "(" Or token.Text = "[" Or token.Text = "{" Then continuation += 1
+                If token.Text = ")" Or token.Text = "]" Or token.Text = "}" Then continuation -= 1
+            Next
+            continuation = Math.Max(0, continuation)
+            If Array.Last(tokens).Text = "_" Then continuedLine = True
+            If continuation > 0 Or continuedLine Then LDTaintRoot(current)
+        Next
+        If constraintRoot <> Nil Then constraintRoot.Unsafe = True
+        If lexer.InComment Or conditional > 0 Or continuation > 0 Or continuedLine Or Array.Count(opaque) > 0 Then Me.mBroken = True
+        For Each node As LDNode In stack
+            node.Unsafe = True
+        Next
+    End Sub
+
+    Private Sub ReadProperty(node As LDNode, tokens As Array Of LDToken, unsafeLine As Boolean)
+        Dim prop As New LDProperty()
+        prop.Name = tokens(0).Text
+        prop.First = tokens(2).First
+        prop.Last = Array.Last(tokens).Last
+        prop.Raw = String.SubstringBytes(Me.mSource, prop.First, prop.Last - prop.First)
+        prop.Kind = LDLiteral(prop.Raw)
+        prop.Safe = Not unsafeLine And prop.Kind <> ""
+        For Each previous As LDProperty In node.Properties
+            If previous.Name = prop.Name Then node.Unsafe = True
+        Next
+        Array.Append(node.Properties, prop)
+        If prop.Name = "Frame" Then
+            node.Frame = prop
+            Me.ReadFrame(prop, tokens)
+            If unsafeLine Or Array.Count(prop.Components) <> 4 Then node.Unsafe = True
+        End If
+        Dim key As String = String.LCase(prop.Name)
+        If key = "x" Or key = "y" Or key = "width" Or key = "height" Or key = "left" Or key = "top" Or key = "right" Or key = "bottom" Or key = "bounds" Or key = "size" Or key = "position" Then node.Unsafe = True
+        If LDLayoutProperty(key) Then LDTaintRoot(node)
+    End Sub
+
+    Private Sub ReadFrame(prop As LDProperty, tokens As Array Of LDToken)
+        prop.Safe = False
+        Dim count As Integer = Array.Count(tokens)
+        If count < 11 Then Return
+        If tokens(2).Text <> "(" Or Array.Last(tokens).Text <> ")" Then Return
+        Dim parts As Array Of LDToken = []
+        Dim i As Integer = 3
+        For component As Integer = 0 To 3
+            If i >= count - 1 Then Return
+            Dim start As Integer = tokens(i).First
+            If tokens(i).Text = "-" Or tokens(i).Text = "+" Then i += 1
+            If i >= count - 1 Then Return
+            Dim finish As Integer = tokens(i).Last
+            Dim raw As String = String.SubstringBytes(Me.mSource, start, finish - start)
+            If LDLiteral(raw) <> "integer" Then Return
+            If component >= 2 And Integer.Parse(raw).Or(-1) < 0 Then Return
+            Array.Append(parts, New LDToken(raw, start, finish))
+            i += 1
+            If component < 3 Then
+                If i >= count - 1 Then Return
+                If tokens(i).Text <> "," Then Return
+                i += 1
+            End If
+        Next
+        If i <> count - 1 Then Return
+        prop.Components = parts
+    End Sub
+
+    Private Sub Publish()
+        For Each record As LDNode In Me.mRecords
+            Dim safe As Boolean = Not Me.mBroken And LDReadable(record)
+            Dim geometry As Boolean = False
+            Dim literalFrame As Boolean = False
+            Dim values As Array Of Integer = [0, 0, 0, 0]
+            If record.Frame <> Nil Then
+                If Array.Count(record.Frame.Components) = 4 Then
+                    literalFrame = True
+                    geometry = safe And Not LDRoot(record).Constrained
+                    For i As Integer = 0 To 3
+                        values(i) = Integer.Parse(record.Frame.Components(i).Text).Or(0)
+                    Next
+                End If
+            End If
+            Dim properties As Array Of LayoutProperty = []
+            For Each prop As LDProperty In record.Properties
+                Array.Append(properties, New LayoutProperty(prop.Name, prop.Raw, safe And prop.Safe))
+            Next
+            Dim parentId As String = ""
+            If record.Parent <> Nil Then parentId = record.Parent.Id
+            ' Ids are unique ("node:" + byte offset); keep the first if that ever changes.
+            If Not Me.mIndex.ContainsKey(record.Id) Then Me.mIndex.Set(record.Id, Array.Count(Me.mNodes))
+            Array.Append(Me.mNodes, New LayoutNode(record.Id, record.TypeName, record.Name, parentId, values(0), values(1), values(2), values(3), geometry, properties, literalFrame))
+        Next
+    End Sub
+
+    Private Function RequireRecord(id As String) As LDNode
+        Dim index As Integer = Me.IndexOf(id)
+        If index < 0 Then Throw New InvalidArgumentException("Unknown layout node in this snapshot")
+        Dim record As LDNode = Me.mRecords(index)
+        If Me.mBroken Or Not LDReadable(record) Then Throw New InvalidArgumentException("Layout region is read-only")
+        Return record
+    End Function
+
+    Public Function FrameEdits(nodeId As String, x As Integer, y As Integer, width As Integer, height As Integer) As Array Of EditorEdit
+        Dim record As LDNode = Me.RequireRecord(nodeId)
+        If LDRoot(record).Constrained Then Throw New InvalidArgumentException("Constrained geometry is read-only")
+        If width < 0 Or height < 0 Then Throw New InvalidArgumentException("Negative layout size")
+        For Each coordinate As Integer In [x, y, width, height]
+            If coordinate < -16777216 Or coordinate > 16777216 Then Throw New InvalidArgumentException("Geometry is outside the supported layout range")
+        Next
+        If record.Frame = Nil Then Throw New InvalidArgumentException("No literal Frame assignment")
+        If Array.Count(record.Frame.Components) <> 4 Then Throw New InvalidArgumentException("Frame is read-only")
+        Dim values As Array Of Integer = [x, y, width, height]
+        Dim edits As Array Of EditorEdit = []
+        For i As Integer = 0 To 3
+            Dim token As LDToken = record.Frame.Components(i)
+            If Integer.Parse(token.Text).Or(0) <> values(i) Then Array.Append(edits, New EditorEdit(token.First, token.Last, String.From(values(i))))
+        Next
+        Return edits
+    End Function
+
+    Public Function PropertyEdits(nodeId As String, propertyName As String, rawValue As String) As Array Of EditorEdit
+        Dim record As LDNode = Me.RequireRecord(nodeId)
+        Dim kind As String = LDLiteral(rawValue)
+        If kind = "" Then Throw New InvalidArgumentException("Expected one single-line literal")
+        For Each prop As LDProperty In record.Properties
+            If prop.Name = propertyName Then
+                If Not prop.Safe Or kind <> prop.Kind Then Throw New InvalidArgumentException("Property is read-only or literal type differs")
+                Dim edits As Array Of EditorEdit = []
+                If String.Compare(prop.Raw, rawValue, True) <> 0 Then Array.Append(edits, New EditorEdit(prop.First, prop.Last, rawValue))
+                Return edits
+            End If
+        Next
+        Throw New InvalidArgumentException("No existing property assignment")
+    End Function
+    Private Function RecordNamed(root As LDNode, name As String) As LDNode
+        Dim found As LDNode = Nil
+        For Each node As LDNode In Me.mRecords
+            If LDRoot(node) = root And String.LCase(node.Name) = String.LCase(name) Then
+                If found <> Nil Then Throw New InvalidArgumentException("Ambiguous control identity")
+                found = node
+            End If
+        Next
+        Return found
+    End Function
+
+    Private Function RequireRoot(id As String) As LDNode
+        Dim root As LDNode = Me.RequireRecord(id)
+        If root.Parent <> Nil Then Throw New InvalidArgumentException("Expected layout root")
+        Return root
+    End Function
+
+    Private Function EOL() As String
+        If String.Contains(Me.mSource, "\r\n", True) Then Return "\r\n"
+        Return "\n"
+    End Function
+
+    Private Function ChildIndent(parent As LDNode) As String
+        For Each node As LDNode In Me.mRecords
+            If node.Parent = parent Then Return node.Indent
+        Next
+        For Each prop As LDProperty In parent.Properties
+            Dim start As Integer = prop.First
+            While start > 0
+                If LDChar(Me.mSource, start - 1) = "\n" Then Exit While
+                start -= 1
+            End While
+            Dim finish As Integer = start
+            While finish < prop.First
+                Dim c As String = LDChar(Me.mSource, finish)
+                If c <> " " And c <> "\t" Then Exit While
+                finish += 1
+            End While
+            If finish > start Then Return String.SubstringBytes(Me.mSource, start, finish - start)
+        Next
+        Return parent.Indent + "    "
+    End Function
+
+    Private Sub UniqueName(root As LDNode, name As String, except As LDNode)
+        If Not LDName(name) Then Throw New InvalidArgumentException("Invalid or reserved identifier")
+        Dim existing As LDNode = Me.RecordNamed(root, name)
+        If existing <> Nil And existing <> except Then Throw New InvalidArgumentException("Duplicate layout identity")
+    End Sub
+
+    ''' Basic unconditional imports used to resolve palette symbols in this snapshot.
+    ''' Aliased, selective and conditional imports are deliberately not inferred.
+    ''' Scanned once per snapshot; every call returns a fresh copy callers may extend.
+    Public Function SourceImports() As Array Of String
+        If Not Me.mImportsReady Then
+            Me.mImports = Me.ScanImports()
+            Me.mImportsReady = True
+        End If
+        Return Array.Clone(Me.mImports)
+    End Function
+
+    Private Function ScanImports() As Array Of String
+        Dim importedModules As Array Of String = []
+        Dim doc As New EditorDocument(Me.mSource, 0)
+        Dim lexer As New LDLexer()
+        Dim blocks As Array Of String = []
+        Dim conditional As Integer = 0
+        For i As Integer = 0 To doc.LineCount - 1
+            Dim scanned As LDLine = lexer.Scan(doc.LineText(i), 0)
+            Dim tokens As Array Of LDToken = scanned.Tokens
+            Dim count As Integer = Array.Count(tokens)
+            If count = 0 Or scanned.Broken Then Continue For
+            Dim first As String = String.LCase(tokens(0).Text)
+            If first = "#" Then
+                If count >= 2 Then
+                    If String.LCase(tokens(1).Text) = "if" Then conditional += 1
+                    If count >= 3 Then
+                        If String.LCase(tokens(1).Text) = "end" And String.LCase(tokens(2).Text) = "if" Then conditional = Math.Max(0, conditional - 1)
+                    End If
+                End If
+                Continue For
+            End If
+            If conditional > 0 Then Continue For
+            Dim kind As String = LDCodeBlock(tokens)
+            If Array.Count(blocks) > 0 Then
+                If count >= 2 And first = "end" Then
+                    If String.LCase(tokens(1).Text) = Array.Last(blocks) Then Array.RemoveAt(blocks, Array.Count(blocks) - 1)
+                ElseIf kind <> "" And Array.Last(blocks) <> "interface" Then
+                    blocks.Append(kind)
+                End If
+                Continue For
+            End If
+            If kind <> "" Then
+                blocks.Append(kind)
+                Continue For
+            End If
+            Dim header As Integer = 0
+            If first = "public" Or first = "private" Then header = 1
+            If count > header Then
+                Dim rootKind As String = String.LCase(tokens(header).Text)
+                If rootKind = "window" Or rootKind = "view" Then
+                    blocks.Append(rootKind)
+                    Continue For
+                End If
+            End If
+            If first <> "import" Or count < 2 Then Continue For
+            Dim modulePath As String = ""
+            Dim basic As Boolean = count Mod 2 = 0
+            For j As Integer = 1 To count - 1
+                If j Mod 2 = 1 Then
+                    If Not LDName(tokens(j).Text) Then basic = False
+                ElseIf tokens(j).Text <> "." Then
+                    basic = False
+                End If
+                modulePath += tokens(j).Text
+            Next
+            If Not basic Or Not LDPath(modulePath) Then Continue For
+            If Not Array.Contains(importedModules, modulePath, True) Then importedModules.Append(modulePath)
+        Next
+        Return importedModules
+    End Function
+
+    ' Explicit JSON scalar values become Buoy literals, never source expressions.
+    Public Function InsertControlEdits(parentId As String, typeName As String, controlName As String, x As Integer, y As Integer, width As Integer, height As Integer) As Array Of EditorEdit
+        Return Me.InsertControlEdits(parentId, typeName, controlName, x, y, width, height, Nil, "")
+    End Function
+
+    ' E903 forbids a Nil default on JSONItem. Overloads preserve omitted properties,
+    ' including calls that supply only the named importName argument.
+    Public Function InsertControlEdits(parentId As String, typeName As String, controlName As String, x As Integer, y As Integer, width As Integer, height As Integer, importName As String) As Array Of EditorEdit
+        Return Me.InsertControlEdits(parentId, typeName, controlName, x, y, width, height, Nil, importName)
+    End Function
+
+    Public Function InsertControlEdits(parentId As String, typeName As String, controlName As String, x As Integer, y As Integer, width As Integer, height As Integer, properties As JSONItem, importName As String = "") As Array Of EditorEdit
+        Dim floatingProperties As Array Of String = []
+        Return Me.InsertControlEdits(parentId, typeName, controlName, x, y, width, height, properties, importName, floatingProperties)
+    End Function
+
+    ' JSON numbers do not retain their original literal spelling. A typed caller
+    ' supplies floating member names so whole-number Double defaults stay Double.
+    Public Function InsertControlEdits(parentId As String, typeName As String, controlName As String, x As Integer, y As Integer, width As Integer, height As Integer, properties As JSONItem, importName As String, floatingProperties As Array Of String) As Array Of EditorEdit
+        Dim parent As LDNode = Me.RequireRecord(parentId)
+        If parent.Parent <> Nil And parent.TypeName <> "View" Then Throw New InvalidArgumentException("Unsupported insertion container")
+        If Not LDPath(typeName) And typeName <> "View" Then Throw New InvalidArgumentException("Invalid source type")
+        ' The installed Control grammar currently accepts one type token only.
+        ' Qualified names are retained when inspecting future/opaque source, but
+        ' must not be emitted as compiler-valid Control declarations yet.
+        If String.Contains(typeName, ".", True) Then Throw New InvalidArgumentException("Compiler does not support qualified Control types; use a source import and unqualified type")
+        If importName <> "" And Not LDPath(importName) Then Throw New InvalidArgumentException("Invalid source import")
+        If width < 0 Or height < 0 Then Throw New InvalidArgumentException("Negative layout size")
+        For Each coordinate As Integer In [x, y, width, height]
+            If coordinate < -16777216 Or coordinate > 16777216 Then Throw New InvalidArgumentException("Geometry is outside the supported layout range")
+        Next
+        Me.UniqueName(LDRoot(parent), controlName, Nil)
+        Dim indent As String = Me.ChildIndent(parent)
+        Dim unit As String = "    "
+        If String.StartsWith(indent, parent.Indent, True) And String.LenBytes(indent) > String.LenBytes(parent.Indent) Then unit = String.SubstringBytes(indent, String.LenBytes(parent.Indent))
+        Dim nl As String = Me.EOL()
+        Dim text As String = indent + "Control " + typeName + " " + controlName + nl
+        text += indent + unit + "Frame = (" + String.From(x) + ", " + String.From(y) + ", " + String.From(width) + ", " + String.From(height) + ")" + nl
+        Dim keys As Array Of String = []
+        If properties <> Nil Then
+            If Not properties.IsObject() Then Throw New InvalidArgumentException("Expected property object")
+            For Each key As String In properties.Keys()
+                If Not LayoutWritablePropertyName(key) Then Throw New InvalidArgumentException("Invalid or structural property name")
+                For Each previous As String In keys
+                    If String.LCase(previous) = String.LCase(key) Then Throw New InvalidArgumentException("Duplicate property")
+                Next
+                Array.Append(keys, key)
+                Dim value As JSONItem = properties.Value(key)
+                Dim raw As String = ""
+                If value.IsString() Then
+                    raw = Json.Stringify(value)
+                ElseIf value.IsBoolean() Then
+                    raw = "False"
+                    If value.AsBoolean().Or(False) Then raw = "True"
+                ElseIf value.IsNumber() Then
+                    raw = Json.Stringify(value)
+                End If
+                If Array.Contains(floatingProperties, key, True) Then
+                    If Not value.IsNumber() Then Throw New InvalidArgumentException("Floating property requires a number")
+                    If Integer.Parse(raw).IsOk Then raw += ".0"
+                    If LDLiteral(raw) <> "double" Then Throw New InvalidArgumentException("Unsupported floating property value")
+                End If
+                If LDLiteral(raw) = "" Then Throw New InvalidArgumentException("Unsupported property value")
+                text += indent + unit + key + " = " + raw + nl
+            Next
+        End If
+        text += indent + "End Control" + nl
+        Dim edits As Array Of EditorEdit = []
+        Array.Append(edits, New EditorEdit(parent.CloseByte, parent.CloseByte, text))
+        If importName <> "" Then
+            Dim imported As Boolean = False
+            For Each importedModule As String In Me.SourceImports()
+                If importedModule = importName Then imported = True
+            Next
+            If Not imported Then Array.Append(edits, New EditorEdit(0, 0, "Import " + importName + nl))
+        End If
+        Return edits
+    End Function
+
+    Private Sub CheckLink(root As LDNode, left As LDNode, leftAnchor As String, right As LDNode, rightAnchor As String, safeArea As Boolean)
+        If left = Nil Then Throw New InvalidArgumentException("Unknown left control")
+        If left.Parent = Nil Or LDRoot(left) <> root Then Throw New InvalidArgumentException("Left control must belong to root")
+        If LDAnchor(leftAnchor) = 0 Then Throw New InvalidArgumentException("Unsupported anchor")
+        If left.Parent <> root Then
+            Dim container As String = left.Parent.TypeName
+            If container <> "View" And container <> "GroupBox" And container <> "RadioGroup" And container <> "Splitter" Then Throw New InvalidArgumentException("Unsupported constraint container")
+        End If
+        If safeArea Then
+            If left.Parent <> root Then Throw New InvalidArgumentException("Nested control cannot reference root SafeArea")
+        ElseIf right <> Nil Then
+            If right = root Or LDRoot(right) <> root Then Throw New InvalidArgumentException("Invalid right control")
+            If right <> left.Parent Then
+                If right.Parent <> left.Parent Or left.Parent.TypeName = "Splitter" Then Throw New InvalidArgumentException("Cross-container constraint")
+            End If
+        Else
+            If LDAnchor(leftAnchor) <> 3 Then Throw New InvalidArgumentException("Only dimensions accept constants")
+            Return
+        End If
+        If LDAnchor(rightAnchor) = 0 Or LDAnchor(leftAnchor) <> LDAnchor(rightAnchor) Then Throw New InvalidArgumentException("Incompatible anchors")
+    End Sub
+
+    Private Function ParseConstraint(item As LDConstraint) As JSONItem
+        Dim data As JSONItem = JSONItem.NewObject()
+        data.Value("id") = "constraint:" + String.From(item.First)
+        data.Value("leftNodeId") = ""
+        data.Value("leftAnchor") = ""
+        data.Value("relation") = ""
+        data.Value("rightNodeId") = ""
+        data.Value("rightAnchor") = ""
+        data.Value("offset") = 0
+        data.Value("priority") = "Required"
+        data.Value("editable") = False
+        data.Value("raw") = String.SubstringBytes(Me.mSource, item.First, item.Last - item.First)
+        If Not item.Safe Then Return data
+        Dim t As Array Of LDToken = item.Tokens
+        Dim n As Integer = Array.Count(t)
+        If n < 5 Then Return data
+        If t(1).Text <> "." Then Return data
+        Dim left As LDNode = Me.RecordNamed(item.Root, t(0).Text)
+        Dim relation As String = t(3).Text
+        Dim cursor As Integer = 4
+        If relation <> "=" And relation <> "<=" And relation <> ">=" Then Return data
+        If cursor >= n Then Return data
+        Dim right As LDNode = Nil
+        Dim safeArea As Boolean = False
+        Dim anchor As String = ""
+        Dim offset As Integer = 0
+        If cursor + 2 < n And t(cursor + 1).Text = "." Then
+            Dim name As String = t(cursor).Text
+            If String.LCase(name) = "me" Then
+                If cursor + 4 >= n Then Return data
+                If String.LCase(t(cursor + 2).Text) <> "safearea" Or t(cursor + 3).Text <> "." Then Return data
+                safeArea = True
+                anchor = t(cursor + 4).Text
+                cursor += 5
+            ElseIf String.LCase(name) = "safearea" Then
+                safeArea = True
+                anchor = t(cursor + 2).Text
+                cursor += 3
+            Else
+                right = Me.RecordNamed(item.Root, name)
+                If right = Nil Then Return data
+                anchor = t(cursor + 2).Text
+                cursor += 3
+            End If
+            If cursor < n Then
+                If t(cursor).Text = "+" Or t(cursor).Text = "-" Then
+                    Dim sign As String = t(cursor).Text
+                    cursor += 1
+                    If cursor >= n Then Return data
+                    Dim raw As String = t(cursor).Text
+                    If sign = "-" Then raw = "-" + raw
+                    If LDNumberKind(raw) <> "integer" Then Return data
+                    offset = Integer.Parse(raw).Or(0)
+                    cursor += 1
+                End If
+            End If
+        Else
+            Dim raw As String = t(cursor).Text
+            cursor += 1
+            If raw = "-" Then
+                If cursor >= n Then Return data
+                raw += t(cursor).Text
+                cursor += 1
+            End If
+            If LDNumberKind(raw) <> "integer" Then Return data
+            offset = Integer.Parse(raw).Or(0)
+        End If
+        Dim priority As String = "Required"
+        If cursor < n Then
+            If String.LCase(t(cursor).Text) <> "priority" Or cursor + 2 <> n Then Return data
+            priority = t(cursor + 1).Text
+            If Not LDPriority(priority) Then Return data
+            cursor += 2
+        End If
+        If cursor <> n Then Return data
+        Try
+            Me.CheckLink(item.Root, left, t(2).Text, right, anchor, safeArea)
+        Catch e As InvalidArgumentException
+            Return data
+        End Try
+        data.Value("leftNodeId") = left.Id
+        data.Value("leftAnchor") = t(2).Text
+        data.Value("relation") = relation
+        If right <> Nil Then data.Value("rightNodeId") = right.Id
+        If safeArea Then data.Value("rightNodeId") = "safearea"
+        data.Value("rightAnchor") = anchor
+        data.Value("offset") = offset
+        data.Value("priority") = priority
+        data.Value("editable") = Not Me.mBroken And LDReadable(item.Root) And item.Root.BlockKind = "window"
+        Return data
+    End Function
+
+    Public Function Constraints(rootId As String) As JSONItem
+        Dim root As LDNode = Me.RequireRoot(rootId)
+        Dim output As JSONItem = JSONItem.NewArray()
+        For Each item As LDConstraint In Me.mConstraints
+            If item.Root = root Then output.Add(Me.ParseConstraint(item))
+        Next
+        Return output
+    End Function
+
+    Private Function RequireConstraint(root As LDNode, id As String) As LDConstraint
+        For Each item As LDConstraint In Me.mConstraints
+            If item.Root <> root Then Continue For
+            Dim data As JSONItem = Me.ParseConstraint(item)
+            If data.Value("id").AsString().Or("") <> id Then Continue For
+            If Not data.Value("editable").AsBoolean().Or(False) Then Throw New InvalidArgumentException("Constraint syntax is read-only")
+            Return item
+        Next
+        Throw New InvalidArgumentException("Unknown constraint in snapshot")
+    End Function
+
+    Public Function ConstraintEdits(rootId As String, constraintId As String, leftNodeId As String, leftAnchor As String, relation As String, rightNodeId As String, rightAnchor As String, offset As Integer, priority As String = "Required") As Array Of EditorEdit
+        Dim root As LDNode = Me.RequireRoot(rootId)
+        If root.BlockKind <> "window" Then Throw New InvalidArgumentException("This compiler supports constraint authoring on Window roots; standalone View constraints are read-only")
+        Dim left As LDNode = Me.RequireRecord(leftNodeId)
+        Dim right As LDNode = Nil
+        Dim safeArea As Boolean = rightNodeId = "safearea"
+        If rightNodeId <> "" And Not safeArea Then right = Me.RequireRecord(rightNodeId)
+        Me.CheckLink(root, left, leftAnchor, right, rightAnchor, safeArea)
+        If relation <> "=" And relation <> "<=" And relation <> ">=" Then Throw New InvalidArgumentException("Invalid relation")
+        If Not LDPriority(priority) Then Throw New InvalidArgumentException("Invalid priority")
+        Dim text As String = left.Name + "." + leftAnchor + " " + relation + " "
+        If safeArea Or right <> Nil Then
+            If safeArea Then
+                text += "Me.SafeArea"
+            Else
+                text += right.Name
+            End If
+            text += "." + rightAnchor
+            If offset < 0 Then
+                text += " - " + String.SubstringBytes(String.From(offset), 1)
+            ElseIf offset > 0 Then
+                text += " + " + String.From(offset)
+            End If
+        Else
+            If rightAnchor <> "" Then Throw New InvalidArgumentException("Constant has no right anchor")
+            text += String.From(offset)
+        End If
+        text += " Priority " + priority
+        If constraintId <> "" Then
+            Dim item As LDConstraint = Me.RequireConstraint(root, constraintId)
+            Return LDTokenEdits(item.Tokens, text)
+        End If
+        Dim indent As String = Me.ChildIndent(root)
+        Dim unit As String = "    "
+        If String.StartsWith(indent, root.Indent, True) And String.LenBytes(indent) > String.LenBytes(root.Indent) Then unit = String.SubstringBytes(indent, String.LenBytes(root.Indent))
+        Dim contentIndent As String = indent + unit
+        For Each existing As LDConstraint In Me.mConstraints
+            If existing.Root = root Then
+                contentIndent = String.SubstringBytes(Me.mSource, existing.LineFirst, existing.First - existing.LineFirst)
+                Exit For
+            End If
+        Next
+        Dim nl As String = Me.EOL()
+        If root.Constrained Then
+            If root.ConstraintClose < 0 Then Throw New InvalidArgumentException("Unclosed Constraints block")
+            Return [New EditorEdit(root.ConstraintClose, root.ConstraintClose, contentIndent + text + nl)]
+        End If
+        Return [New EditorEdit(root.CloseByte, root.CloseByte, indent + "Constraints" + nl + contentIndent + text + nl + indent + "End Constraints" + nl)]
+    End Function
+
+    Public Function DeleteConstraintEdits(rootId As String, constraintId As String) As Array Of EditorEdit
+        Dim item As LDConstraint = Me.RequireConstraint(Me.RequireRoot(rootId), constraintId)
+        ' Keep trailing comments and line endings in place.
+        Return [New EditorEdit(item.First, item.Last, "")]
+    End Function
+
+    ''' Layout-local only: declaration and constraint references in this root.
+    ''' Project refactoring must prove and update code-behind references separately.
+    Public Function RenameControlEdits(nodeId As String, newName As String) As Array Of EditorEdit
+        Dim node As LDNode = Me.RequireRecord(nodeId)
+        Dim root As LDNode = LDRoot(node)
+        Me.UniqueName(root, newName, node)
+        Dim edits As Array Of EditorEdit = []
+        If newName = node.Name Then Return edits
+        Array.Append(edits, New EditorEdit(node.NameToken.First, node.NameToken.Last, newName))
+        For Each item As LDConstraint In Me.mConstraints
+            If item.Root <> root Then Continue For
+            Dim data As JSONItem = Me.ParseConstraint(item)
+            If Not data.Value("editable").AsBoolean().Or(False) Then Throw New InvalidArgumentException("Cannot prove opaque constraint references")
+            For i As Integer = 0 To Array.Count(item.Tokens) - 2
+                Dim token As LDToken = item.Tokens(i)
+                If String.LCase(token.Text) = String.LCase(node.Name) And item.Tokens(i + 1).Text = "." Then
+                    Array.Append(edits, New EditorEdit(token.First, token.Last, newName))
+                End If
+            Next
+        Next
+        Return edits
+    End Function
+
+    ''' Removes layout source only; project code-behind remains the caller's responsibility.
+    Public Function DeleteControlEdits(nodeId As String) As Array Of EditorEdit
+        Dim node As LDNode = Me.RequireRecord(nodeId)
+        Dim root As LDNode = LDRoot(node)
+        Dim edits As Array Of EditorEdit = []
+        Array.Append(edits, New EditorEdit(node.First, node.Last, ""))
+        If node = root Then Return edits
+        For Each item As LDConstraint In Me.mConstraints
+            If item.Root <> root Then Continue For
+            Dim data As JSONItem = Me.ParseConstraint(item)
+            If Not data.Value("editable").AsBoolean().Or(False) Then Throw New InvalidArgumentException("Cannot prove opaque constraint dependencies")
+            Dim dependent As Boolean = False
+            For Each candidate As LDNode In Me.mRecords
+                If candidate.First < node.First Or candidate.Last > node.Last Then Continue For
+                If data.Value("leftNodeId").AsString().Or("") = candidate.Id Or data.Value("rightNodeId").AsString().Or("") = candidate.Id Then dependent = True
+            Next
+            If dependent Then Array.Append(edits, New EditorEdit(item.First, item.Last, ""))
+        Next
+        Return edits
+    End Function
+    Private Function LineStart(offset As Integer) As Integer
+        Dim start As Integer = offset
+        While start > 0
+            If LDChar(Me.mSource, start - 1) = "\n" Then Exit While
+            start -= 1
+        End While
+        Return start
+    End Function
+
+    Private Function NextLine(offset As Integer) As Integer
+        Dim found As Integer = String.IndexOfBytes(Me.mSource, "\n", offset, True)
+        If found < 0 Then Return String.LenBytes(Me.mSource)
+        Return found + 1
+    End Function
+
+    ' Line starts that begin inside a /* block comment */.
+    Private Function CommentInteriorLines() As Array Of Integer
+        If Me.mInteriorReady Then Return Me.mInterior
+        Dim inside As Array Of Integer = []
+        Dim doc As New EditorDocument(Me.mSource, 0)
+        Dim lexer As New LDLexer()
+        For i As Integer = 0 To doc.LineCount - 1
+            If lexer.InComment Then inside.Append(doc.LineStartByte(i))
+            lexer.Scan(doc.LineText(i), 0)
+        Next
+        Me.mInterior = inside
+        Me.mInteriorReady = True
+        Return inside
+    End Function
+
+    ' Only unconditional, unaliased imports make a pasted type available.
+    Private Function ImportMentioned(modulePath As String) As Boolean
+        For Each imported As String In Me.SourceImports()
+            If String.Compare(imported, modulePath, True) = 0 Then Return True
+        Next
+        Return False
+    End Function
+
+    ' Clipboard text must carry only literal property values. Symbols rooted at
+    ' Me/Super/Self could be parenless calls, so they never travel either.
+    Private Function UnsafeProperty(record As LDNode) As String
+        For Each prop As LDProperty In record.Properties
+            If prop.Name = "Frame" Then Continue For
+            If Not prop.Safe Then Return prop.Name
+            If prop.Kind = "symbol" Then
+                Dim head As String = String.LCase(String.Split(prop.Raw, ".")(0))
+                If head = "me" Or head = "super" Or head = "self" Or head = "mybase" Then Return prop.Name
+            End If
+        Next
+        Return ""
+    End Function
+
+    ' A control block owns the contiguous ' or // comment lines directly above it.
+    Private Function BlockStart(record As LDNode) As Integer
+        Dim inside As Array Of Integer = Me.CommentInteriorLines()
+        Dim start As Integer = record.First
+        While start > 0
+            Dim previous As Integer = Me.LineStart(start - 1)
+            If Array.Contains(inside, previous) Then Exit While
+            Dim trimmed As String = String.LTrim(String.SubstringBytes(Me.mSource, previous, start - previous))
+            If Not String.StartsWith(trimmed, "'", True) And Not String.StartsWith(trimmed, "//", True) Then Exit While
+            start = previous
+        End While
+        Return start
+    End Function
+
+    Private Function Children(parent As LDNode) As Array Of LDNode
+        Dim found As Array Of LDNode = []
+        For Each node As LDNode In Me.mRecords
+            If node.Parent = parent Then found.Append(node)
+        Next
+        Return found
+    End Function
+
+    Private Function Within(node As LDNode, outer As LDNode) As Boolean
+        Return node.First >= outer.First And node.Last <= outer.Last
+    End Function
+
+    Private Function IndentUnit(parent As LDNode) As String
+        Dim indent As String = Me.ChildIndent(parent)
+        If String.StartsWith(indent, parent.Indent, True) And String.LenBytes(indent) > String.LenBytes(parent.Indent) Then Return String.SubstringBytes(indent, String.LenBytes(parent.Indent))
+        Return "    "
+    End Function
+
+    Private Function NamesIn(root As LDNode) As Array Of String
+        Dim names As Array Of String = []
+        For Each node As LDNode In Me.mRecords
+            If LDRoot(node) = root Then names.Append(node.Name)
+        Next
+        Return names
+    End Function
+
+    Private Function RequireContainer(id As String) As LDNode
+        Dim parent As LDNode = Me.RequireRecord(id)
+        If parent.Parent <> Nil And String.Compare(parent.TypeName, "View", True) <> 0 Then Throw New InvalidArgumentException("Controls can only be placed in the layout root or a View")
+        Return parent
+    End Function
+
+    Private Sub ShiftFrame(edits As Array Of EditorEdit, record As LDNode, dx As Integer, dy As Integer)
+        If dx = 0 And dy = 0 Then Return
+        If record.Frame = Nil Then Throw New InvalidArgumentException("Control '" + record.Name + "' has no literal Frame to move")
+        If Array.Count(record.Frame.Components) <> 4 Then Throw New InvalidArgumentException("Control '" + record.Name + "' has no literal Frame to move")
+        Dim deltas As Array Of Integer = [dx, dy]
+        For i As Integer = 0 To 1
+            Dim token As LDToken = record.Frame.Components(i)
+            Dim original As Integer = Me.FrameValue(record, i)
+            If deltas(i) < -16777216 - original Or deltas(i) > 16777216 - original Then Throw New InvalidArgumentException("Geometry is outside the supported layout range")
+            Dim value As Integer = original + deltas(i)
+            If deltas(i) <> 0 Then edits.Append(New EditorEdit(token.First, token.Last, String.From(value)))
+        Next
+    End Sub
+
+    Private Function FrameValue(record As LDNode, index As Integer) As Integer
+        Dim value As Integer = Integer.Parse(record.Frame.Components(index).Text).Or(0)
+        If value < -16777216 Or value > 16777216 Then Throw New InvalidArgumentException("Geometry is outside the supported layout range")
+        Return value
+    End Function
+
+    ' Constraints may only reference a nested control's own container and siblings,
+    ' so moving a referenced control between containers is refused, never rewritten.
+    Private Sub RefuseConstraintReferences(root As LDNode, moved As Array Of LDNode, action As String)
+        For Each item As LDConstraint In Me.mConstraints
+            If item.Root <> root Then Continue For
+            For i As Integer = 0 To Array.Count(item.Tokens) - 2
+                If item.Tokens(i + 1).Text <> "." Then Continue For
+                For Each outer As LDNode In moved
+                    For Each node As LDNode In Me.mRecords
+                        If Not Me.Within(node, outer) Then Continue For
+                        If String.LCase(node.Name) = String.LCase(item.Tokens(i).Text) Then Throw New InvalidArgumentException("Cannot " + action + ": constraint references '" + node.Name + "'. Remove that constraint first")
+                    Next
+                Next
+            Next
+        Next
+    End Sub
+
+    ''' Z-order is declaration order among siblings (later = in front). Moves whole
+    ''' control blocks with their leading comment lines; all bytes are retained.
+    ''' mode: front|forward|backward|back. An unchanged order returns no edits.
+    Public Function ReorderEdits(nodeId As String, mode As String) As Array Of EditorEdit
+        Dim record As LDNode = Me.RequireRecord(nodeId)
+        If record.Parent = Nil Then Throw New InvalidArgumentException("The layout root has no stacking order")
+        Dim siblings As Array Of LDNode = Me.Children(record.Parent)
+        Dim index As Integer = LDIndex(siblings, record)
+        Dim target As Integer = index
+        Select Case mode
+        Case "front"
+            target = Array.Count(siblings) - 1
+        Case "forward"
+            target = Math.Min(index + 1, Array.Count(siblings) - 1)
+        Case "backward"
+            target = Math.Max(index - 1, 0)
+        Case "back"
+            target = 0
+        Case Else
+            Throw New InvalidArgumentException("Unknown arrange command: " + mode)
+        End Select
+        Dim edits As Array Of EditorEdit = []
+        If target = index Then Return edits
+        Dim low As Integer = Math.Min(index, target)
+        Dim high As Integer = Math.Max(index, target)
+        Dim order As Array Of LDNode = []
+        For k As Integer = low To high
+            If Not LDReadable(siblings(k)) Then Throw New InvalidArgumentException("Layout region is read-only")
+            If k <> index Then order.Append(siblings(k))
+        Next
+        Array.Insert(order, target - low, record)
+        Dim text As String = ""
+        For k As Integer = low To high
+            Dim moved As LDNode = order(k - low)
+            text += String.SubstringBytes(Me.mSource, Me.BlockStart(moved), moved.Last - Me.BlockStart(moved))
+            If k < high Then text += String.SubstringBytes(Me.mSource, siblings(k).Last, Me.BlockStart(siblings(k + 1)) - siblings(k).Last)
+        Next
+        Dim first As Integer = Me.BlockStart(siblings(low))
+        edits.Append(New EditorEdit(first, siblings(high).Last, text))
+        Return edits
+    End Function
+
+    ''' Self-contained clipboard text for the selected control blocks, including
+    ''' nested children and leading comments. Imports are inferred: none when every
+    ''' copied type is a built-in control, otherwise this file's basic imports.
+    Public Function CopySnippet(ids As Array Of String) As String
+        Dim inferred As Array Of String = []
+        Return Me.SnippetText(ids, inferred, True)
+    End Function
+
+    ''' imports: exact source imports the snippet needs (for example catalog
+    ''' sourceImport metadata); an empty array records none.
+    Public Function CopySnippet(ids As Array Of String, imports As Array Of String) As String
+        Return Me.SnippetText(ids, imports, False)
+    End Function
+
+    Private Function SnippetText(ids As Array Of String, imports As Array Of String, infer As Boolean) As String
+        If Array.Count(ids) = 0 Then Throw New InvalidArgumentException("Select at least one control to copy")
+        Dim picked As Array Of LDNode = []
+        For Each id As String In ids
+            Dim record As LDNode = Me.RequireRecord(id)
+            If record.Parent = Nil Then Throw New InvalidArgumentException("The layout root cannot be copied; select its controls instead")
+            If Array.Count(picked) > 0 Then
+                If LDRoot(record) <> LDRoot(picked(0)) Then Throw New InvalidArgumentException("Copy controls from one layout at a time")
+            End If
+            If LDIndex(picked, record) < 0 Then picked.Append(record)
+        Next
+        Dim tops As Array Of LDNode = []
+        For Each record As LDNode In Me.mRecords
+            If LDIndex(picked, record) < 0 Then Continue For
+            Dim covered As Boolean = False
+            For Each other As LDNode In picked
+                If other <> record And Me.Within(record, other) Then covered = True
+            Next
+            If Not covered Then tops.Append(record)
+        Next
+        For Each record As LDNode In Me.mRecords
+            For Each top As LDNode In tops
+                If Not Me.Within(record, top) Then Continue For
+                Dim computed As String = Me.UnsafeProperty(record)
+                If computed <> "" Then Throw New InvalidArgumentException("Control '" + record.Name + "' cannot be copied: " + computed + " is not a plain literal value")
+            Next
+        Next
+        Dim needed As Array Of String = []
+        If infer Then
+            Dim builtin As Boolean = True
+            For Each record As LDNode In Me.mRecords
+                For Each top As LDNode In tops
+                    If Me.Within(record, top) And Not LDBuiltinControl(record.TypeName) Then builtin = False
+                Next
+            Next
+            If Not builtin Then needed = Me.SourceImports()
+        Else
+            For Each name As String In imports
+                If Not LDPath(name) Then Throw New InvalidArgumentException("Invalid source import: " + name)
+                If Not LDHasName(needed, name) Then needed.Append(name)
+            Next
+        End If
+        Dim text As String = LDSnippetMarker() + "\n"
+        For Each name As String In needed
+            text += LDSnippetImport() + name + "\n"
+        Next
+        For Each top As LDNode In tops
+            Dim start As Integer = Me.BlockStart(top)
+            Dim chunk As String = String.Replace(String.SubstringBytes(Me.mSource, start, top.Last - start), "\r\n", "\n", True)
+            If Not String.EndsWith(chunk, "\n", True) Then chunk += "\n"
+            text += LDReindent(chunk, top.Indent, "")
+        Next
+        Return text
+    End Function
+
+    ''' Plan inserting a CopySnippet text as the front-most children of parentId
+    ''' (root or View). Clashing names in the destination root are renumbered
+    ''' (button1 -> button2), top-level frames are offset by (offsetX, offsetY),
+    ''' text is re-indented and recorded imports missing here are added.
+    Public Function PlanPaste(parentId As String, snippet As String, offsetX As Integer, offsetY As Integer) As LayoutPastePlan
+        Dim parent As LDNode = Me.RequireContainer(parentId)
+        Dim normalized As String = String.Replace(snippet, "\r\n", "\n", True)
+        Dim lines As Array Of String = String.Split(normalized, "\n")
+        If Array.Count(lines) < 2 Then Throw New InvalidArgumentException("The clipboard does not contain Buoy layout controls")
+        If String.Compare(String.RTrim(lines(0)), LDSnippetMarker(), True) <> 0 Then Throw New InvalidArgumentException("The clipboard does not contain Buoy layout controls")
+        Dim imports As Array Of String = []
+        Dim bodyStart As Integer = 1
+        While bodyStart < Array.Count(lines)
+            If Not String.StartsWith(lines(bodyStart), LDSnippetImport(), True) Then Exit While
+            Dim name As String = String.Trim(String.SubstringBytes(lines(bodyStart), String.LenBytes(LDSnippetImport())))
+            If Not LDPath(name) Then Throw New InvalidArgumentException("The clipboard snippet names an invalid import")
+            If Not Array.Contains(imports, name, True) Then imports.Append(name)
+            bodyStart += 1
+        End While
+        Dim body As String = ""
+        For i As Integer = bodyStart To Array.Count(lines) - 1
+            If i = Array.Count(lines) - 1 And lines(i) = "" Then Exit For
+            body += lines(i) + "\n"
+        Next
+        Dim header As String = "View " + LDSnippetRoot() + "\n"
+        Dim wrapped As String = header + body + "End View\n"
+        Dim parsed As New LayoutDocument(wrapped)
+        Dim invalid As String = "The clipboard snippet is not a plain list of layout controls"
+        If parsed.mBroken Or Array.Count(parsed.mRecords) < 2 Then Throw New InvalidArgumentException(invalid)
+        Dim root As LDNode = parsed.mRecords(0)
+        If root.Parent <> Nil Or root.Name <> LDSnippetRoot() Or Not LDReadable(root) Or root.Constrained Then Throw New InvalidArgumentException(invalid)
+        If Array.Count(root.Properties) > 0 Or root.CloseByte <> String.LenBytes(header + body) Then Throw New InvalidArgumentException(invalid)
+        For Each record As LDNode In parsed.mRecords
+            If LDRoot(record) <> root Or Not LDReadable(record) Then Throw New InvalidArgumentException(invalid)
+        Next
+        Dim taken As Array Of String = Me.NamesIn(LDRoot(parent))
+        Dim edits As Array Of EditorEdit = []
+        Dim plan As New LayoutPastePlan()
+        For Each record As LDNode In parsed.mRecords
+            If record = root Then Continue For
+            Dim top As Boolean = record.Parent = root
+            If String.Contains(record.TypeName, ".", True) Then Throw New InvalidArgumentException("Compiler does not support qualified Control types; use a source import and unqualified type")
+            If String.Compare(record.TypeName, "RadioButton", True) = 0 And (top Or String.Compare(record.Parent.TypeName, "RadioGroup", True) <> 0) Then Throw New InvalidArgumentException("Radio buttons can only be pasted into a RadioGroup")
+            If Not top And String.Compare(record.Parent.TypeName, "View", True) <> 0 And String.Compare(record.Parent.TypeName, "GroupBox", True) <> 0 And String.Compare(record.Parent.TypeName, "RadioGroup", True) <> 0 Then Throw New InvalidArgumentException("Only View, GroupBox and RadioGroup controls can contain pasted controls")
+            If Me.UnsafeProperty(record) <> "" Then Throw New InvalidArgumentException("The clipboard snippet sets " + Me.UnsafeProperty(record) + " to a value that is not a plain literal")
+            Dim name As String = record.Name
+            If LDHasName(taken, name) Or Not LDName(name) Then
+                name = LDNextName(record.Name, taken)
+                edits.Append(New EditorEdit(record.NameToken.First, record.NameToken.Last, name))
+            End If
+            taken.Append(name)
+            If top Then
+                plan.Names.Append(name)
+                If record.Frame <> Nil Then
+                    If Array.Count(record.Frame.Components) = 4 Then parsed.ShiftFrame(edits, record, offsetX, offsetY)
+                End If
+            End If
+        Next
+        Dim text As String = LDSlice(wrapped, String.LenBytes(header), root.CloseByte, edits)
+        text = LDReindent(text, "", Me.ChildIndent(parent))
+        Dim nl As String = Me.EOL()
+        If nl <> "\n" Then text = String.Replace(text, "\n", nl, True)
+        plan.Edits.Append(New EditorEdit(parent.CloseByte, parent.CloseByte, text))
+        Dim missing As String = ""
+        For Each name As String In imports
+            If Not Me.ImportMentioned(name) Then
+                missing += "Import " + name + nl
+                plan.Imports.Append(name)
+            End If
+        Next
+        If missing <> "" Then plan.Edits.Append(New EditorEdit(0, 0, missing))
+        Return plan
+    End Function
+
+    ''' Wrap same-container controls in a new View sized to their bounds; children
+    ''' are re-based to View coordinates. Names (and code-behind references such as
+    ''' Me.name or With name) are unchanged because nested controls remain typed
+    ''' members of the window class. Refused when a constraint references them.
+    Public Function PlanEmbed(ids As Array Of String, containerName As String) As LayoutPastePlan
+        If Array.Count(ids) = 0 Then Throw New InvalidArgumentException("Select at least one control to embed")
+        Dim picked As Array Of LDNode = []
+        For Each id As String In ids
+            Dim record As LDNode = Me.RequireRecord(id)
+            If record.Parent = Nil Then Throw New InvalidArgumentException("The layout root cannot be embedded")
+            If LDIndex(picked, record) >= 0 Then Throw New InvalidArgumentException("A control is selected more than once")
+            If Array.Count(picked) > 0 Then
+                If record.Parent <> picked(0).Parent Then Throw New InvalidArgumentException("Controls must share a container")
+            End If
+            picked.Append(record)
+        Next
+        Dim parent As LDNode = Me.RequireContainer(picked(0).Parent.Id)
+        Dim root As LDNode = LDRoot(parent)
+        Dim ordered As Array Of LDNode = []
+        For Each record As LDNode In Me.mRecords
+            If LDIndex(picked, record) >= 0 Then ordered.Append(record)
+        Next
+        Dim left As Integer = 16777216
+        Dim top As Integer = 16777216
+        Dim right As Integer = -16777216
+        Dim bottom As Integer = -16777216
+        For Each record As LDNode In ordered
+            If String.Compare(record.TypeName, "RadioButton", True) = 0 Then Throw New InvalidArgumentException("Radio buttons must stay inside their RadioGroup")
+            If record.Frame = Nil Then Throw New InvalidArgumentException("Control '" + record.Name + "' has no literal Frame, so it cannot be moved into a View")
+            If Array.Count(record.Frame.Components) <> 4 Then Throw New InvalidArgumentException("Control '" + record.Name + "' has no literal Frame, so it cannot be moved into a View")
+            left = Math.Min(left, Me.FrameValue(record, 0))
+            top = Math.Min(top, Me.FrameValue(record, 1))
+            right = Math.Max(right, Me.FrameValue(record, 0) + Me.FrameValue(record, 2))
+            bottom = Math.Max(bottom, Me.FrameValue(record, 1) + Me.FrameValue(record, 3))
+        Next
+        If right - left > 16777216 Or bottom - top > 16777216 Then Throw New InvalidArgumentException("Geometry is outside the supported layout range")
+        Me.RefuseConstraintReferences(root, ordered, "embed")
+        Dim name As String = containerName
+        If name = "" Then
+            name = LDNextName("view1", Me.NamesIn(root))
+            If Me.RecordNamed(root, "view1") = Nil Then name = "view1"
+        End If
+        Me.UniqueName(root, name, Nil)
+        Dim indent As String = ordered(0).Indent
+        Dim unit As String = Me.IndentUnit(parent)
+        Dim nl As String = Me.EOL()
+        Dim text As String = indent + "Control View " + name + nl
+        text += indent + unit + "Frame = (" + String.From(left) + ", " + String.From(top) + ", " + String.From(right - left) + ", " + String.From(bottom - top) + ")" + nl
+        Dim plan As New LayoutPastePlan()
+        For Each record As LDNode In ordered
+            Dim shift As Array Of EditorEdit = []
+            Me.ShiftFrame(shift, record, -left, -top)
+            Dim start As Integer = Me.BlockStart(record)
+            text += LDReindent(LDSlice(Me.mSource, start, record.Last, shift), record.Indent, indent + unit)
+            If record <> ordered(0) Then plan.Edits.Append(New EditorEdit(start, record.Last, ""))
+        Next
+        text += indent + "End Control" + nl
+        Array.Insert(plan.Edits, 0, New EditorEdit(Me.BlockStart(ordered(0)), ordered(0).Last, text))
+        plan.Names.Append(name)
+        Return plan
+    End Function
+
+    ''' Remove a plain View (Frame only) and move its children to the View's
+    ''' container, re-based to container coordinates. Code-behind that names the
+    ''' View itself (Me.view, With view) stops compiling; hosts should prove there
+    ''' are no such references (for example with LayoutProjectRefactor.PlanDelete).
+    Public Function PlanUnembed(viewId As String) As LayoutPastePlan
+        Dim view As LDNode = Me.RequireRecord(viewId)
+        If view.Parent = Nil Or String.Compare(view.TypeName, "View", True) <> 0 Then Throw New InvalidArgumentException("Select a View control to unembed")
+        Me.RequireContainer(view.Parent.Id)
+        For Each prop As LDProperty In view.Properties
+            If prop.Name <> "Frame" Then Throw New InvalidArgumentException("View '" + view.Name + "' sets " + prop.Name + ", which would be lost; remove it before unembedding")
+        Next
+        If view.Frame = Nil Then Throw New InvalidArgumentException("View '" + view.Name + "' has no literal Frame")
+        If Array.Count(view.Frame.Components) <> 4 Then Throw New InvalidArgumentException("View '" + view.Name + "' has no literal Frame")
+        Dim children As Array Of LDNode = Me.Children(view)
+        If Array.Count(children) = 0 Then Throw New InvalidArgumentException("View '" + view.Name + "' contains no controls to unembed")
+        Me.RefuseConstraintReferences(LDRoot(view), [view], "unembed")
+        Dim edits As Array Of EditorEdit = []
+        Dim plan As New LayoutPastePlan()
+        For Each child As LDNode In children
+            Me.ShiftFrame(edits, child, Me.FrameValue(view, 0), Me.FrameValue(view, 1))
+            plan.Names.Append(child.Name)
+        Next
+        Dim frameLine As Integer = Me.LineStart(view.Frame.First)
+        edits.Append(New EditorEdit(frameLine, Me.NextLine(view.Frame.First), ""))
+        Dim text As String = LDSlice(Me.mSource, Me.NextLine(view.First), view.CloseByte, edits)
+        text = LDReindent(text, children(0).Indent, view.Indent)
+        ' Trailing comments on the removed header, Frame and End lines become
+        ' standalone comment lines so no source commentary is lost.
+        Dim nl As String = Me.EOL()
+        Dim headerNote As String = String.Trim(String.SubstringBytes(Me.mSource, view.NameToken.Last, Me.NextLine(view.First) - view.NameToken.Last))
+        Dim frameNote As String = String.Trim(String.SubstringBytes(Me.mSource, view.Frame.Last, Me.NextLine(view.Frame.First) - view.Frame.Last))
+        Dim closing As String = String.SubstringBytes(Me.mSource, view.CloseByte, view.Last - view.CloseByte)
+        Dim closer As New LDLexer()
+        Dim closeTokens As Array Of LDToken = closer.Scan(closing, 0).Tokens
+        Dim endNote As String = String.Trim(String.SubstringBytes(closing, Array.Last(closeTokens).Last))
+        If frameNote <> "" Then text = view.Indent + frameNote + nl + text
+        If headerNote <> "" Then text = view.Indent + headerNote + nl + text
+        If endNote <> "" Then text += view.Indent + endNote + nl
+        plan.Edits.Append(New EditorEdit(view.First, view.Last, text))
+        Return plan
+    End Function
+End Class

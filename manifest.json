@@ -2,5 +2,5 @@
   "schema": 1,
   "name": "layoutkit",
   "version": "0.1.0",
-  "description": "Conservative headless declarative layout source snapshots and UTF-8 EditorKit edits"
+  "description": "Inspect and edit declarative layouts without a GUI"
 }

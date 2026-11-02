@@ -15,7 +15,7 @@ This complete example inspects a simple Window declaration. The layout text is d
 
 For mutations, retain the snapshot revision along with proposed `EditorEdit` values. Recheck that revision against the authoritative document before applying the entire batch. Reload after commits and after undo/redo; resolve node IDs again. Empty or unsupported edit proposals must not be mistaken for a successful source change.
 
-```buoy
+```basic
 Import layoutkit.LayoutDocument
 
 Sub Main()

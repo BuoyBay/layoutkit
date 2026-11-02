@@ -1,6 +1,6 @@
 # Inspect and edit declarative layouts without a GUI
 
-A headless source model and explicit extension catalog for the native Buoy layout editor. Requires EditorKit. Import `layoutkit.LayoutDocument` for `LayoutDocument`, `LayoutNode` and `LayoutProperty`, and `layoutkit.LayoutCatalog` for catalog descriptors and extension interfaces. Buoy 0.72 rejects selective imports of these classes/interfaces; there is no self-named module for bare `Import layoutkit`.
+A headless source model and explicit extension catalog for the native layout editor. Requires EditorKit. Import `layoutkit.LayoutDocument` for `LayoutDocument`, `LayoutNode` and `LayoutProperty`, and `layoutkit.LayoutCatalog` for catalog descriptors and extension interfaces. Buoy 0.72 rejects selective imports of these classes/interfaces; there is no self-named module for bare `Import layoutkit`.
 
 `LayoutDocument(sourceText, version)` is an immutable snapshot. `Nodes`, `FindNode`, `FrameEdits` and `PropertyEdits` inspect source or propose half-open UTF-8 `EditorEdit` ranges. The host keeps the authoritative `EditorDocument`, compares the snapshot version with its current revision, and applies the entire batch once. It then reloads a fresh snapshot. Node IDs belong to a snapshot; resolve them again after source changes. Undo, redo, saved baselines and disk persistence belong to the host.
 
@@ -18,7 +18,7 @@ BPM also resolves `editorkit`.
 
 ## Example
 
-```buoy
+```basic
 Import layoutkit.LayoutDocument
 
 Sub Main()
@@ -45,7 +45,6 @@ On your own machine, install Buoy and run:
 buoy ai init --both
 ```
 
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 

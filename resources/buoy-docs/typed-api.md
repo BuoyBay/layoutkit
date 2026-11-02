@@ -579,7 +579,7 @@ Returns: no value.
 
 `Public Sub RegisterBuiltinControls()`
 
-Registers the core UI controls the Control grammar can declare without constructor arguments (Splitter needs one, so it is a glyph-only layout type). Property spellings are compiler-checked by tests/layoutkit_catalog_test.bui.
+Registers the core UI controls the Control grammar can declare without constructor arguments (Splitter needs one, so it is a glyph-only layout type). Property spellings follow the declarative Control grammar.
 
 No parameters.
 
@@ -829,7 +829,7 @@ No parameters.
 
 `Public Class LayoutDiscovery`
 
-Data-only discovery. Refresh the index with discover_layout_packages.py before startup discovery; this module intentionally has no native ZIP dependency.
+Data-only discovery. Have the host prepare its package discovery index before startup discovery; this module intentionally has no native ZIP dependency.
 
 ### Constructor
 

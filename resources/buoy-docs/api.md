@@ -50,5 +50,4 @@ related: ["index.md", "getting-started.md", "typed-api.md"]
 - [Getting started](getting-started.md)
 - [API reference](api.md)
 
-
 [Full typed API: properties, parameters, defaults, and returns](typed-api.md)

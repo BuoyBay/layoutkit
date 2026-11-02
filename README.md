@@ -1,4 +1,4 @@
-# Inspect and edit declarative layouts without a GUI
+# Headless declarative layout model and catalog
 
 A headless source model and explicit extension catalog for the native layout editor. Requires EditorKit. Import `layoutkit.LayoutDocument` for `LayoutDocument`, `LayoutNode` and `LayoutProperty`, and `layoutkit.LayoutCatalog` for catalog descriptors and extension interfaces. Buoy 0.72 rejects selective imports of these classes/interfaces; there is no self-named module for bare `Import layoutkit`.
 
